@@ -83,6 +83,17 @@ class SiteEngine:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                # Use the NEW headless mode (Chrome's real headless) instead
+                # of the legacy --headless=chrome flag. The old headless mode
+                # identifies itself as "HeadlessChrome" in sec-ch-ua, which
+                # Cloudflare/LiteSpeed WAFs detect and use to return 403 on
+                # form submits. The new mode reports as regular Chrome.
+                "--headless=new",
+                # Disable automation info bar and other giveaways
+                "--disable-infobars",
+                "--disable-extensions",
+                "--password-store=basic",
+                "--use-mock-keychain",
             ],
         )
         self.context = await self.browser.new_context(
@@ -93,11 +104,89 @@ class SiteEngine:
             ),
             viewport={"width": 1366, "height": 768},
             locale="en-US",
+            # Override sec-ch-ua headers — Playwright's headless Chromium
+            # normally sends '"HeadlessChrome";v="X"' here, which the WAF
+            # uses to detect and block automation. Force real-Chrome values.
+            extra_http_headers={
+                "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "accept-language": "en-US,en;q=0.9",
+            },
         )
 
-        # Remove webdriver detection
+        # Remove webdriver detection + override navigator.userAgentData
+        # (Playwright leaks "HeadlessChrome" brand via navigator.userAgentData.brands)
         await self.context.add_init_script(
-            'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
+            """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+            // Override navigator.userAgentData to report regular Chrome brands.
+            // We preserve all original methods (getHighEntropyValues etc.) by
+            // creating a fresh object with the same prototype chain.
+            if (navigator.userAgentData) {
+                const origUAD = navigator.userAgentData;
+                const fakeBrands = [
+                    {brand: 'Chromium', version: '131'},
+                    {brand: 'Not_A Brand', version: '24'},
+                    {brand: 'Google Chrome', version: '131'}
+                ];
+                const fakeUAD = Object.create(Object.getPrototypeOf(origUAD));
+                Object.defineProperties(fakeUAD, {
+                    brands:       {get: () => fakeBrands, configurable: true},
+                    mobile:       {get: () => false, configurable: true},
+                    platform:     {get: () => 'Windows', configurable: true},
+                    getHighEntropyValues: {
+                        value: async (hints) => ({
+                            architecture: 'x86',
+                            bitness: '64',
+                            brands: fakeBrands,
+                            mobile: false,
+                            model: '',
+                            platform: 'Windows',
+                            platformVersion: '15.0.0',
+                            uaFullVersion: '131.0.0.0',
+                            fullWidth: '131.0.6778.85',
+                        }),
+                        configurable: true,
+                    },
+                    toJSON: {
+                        value: () => ({brands: fakeBrands, mobile: false, platform: 'Windows'}),
+                        configurable: true,
+                    },
+                });
+                Object.defineProperty(navigator, 'userAgentData', {
+                    get: () => fakeUAD,
+                    configurable: true,
+                });
+            }
+
+            // Override permissions API (headless Chrome reports differently)
+            const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+            if (origQuery) {
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications'
+                        ? Promise.resolve({state: Notification.permission})
+                        : origQuery(parameters)
+                );
+            }
+
+            // Plugins — headless Chrome has no plugins, real Chrome has 5
+            try {
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                    configurable: true,
+                });
+            } catch (e) {}
+
+            // Languages — make sure en-US is first
+            try {
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                    configurable: true,
+                });
+            } catch (e) {}
+            """
         )
 
         # Restore saved cookies
