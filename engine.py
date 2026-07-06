@@ -1974,6 +1974,14 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
 
     await engine.on_status("⏳ Submitting payment to RazorPay...")
 
+    # ------------------------------------------------------------------
+    # STEP 3: Inject JS to capture RazorPay success/failure events.
+    # RazorPay's handler flow fires `handler(response)` on success and
+    # `rzp1.on('payment.failed', ...)` on decline. We register listeners
+    # BEFORE clicking Pay so we capture the authoritative event.
+    # ------------------------------------------------------------------
+    await _inject_razorpay_event_listeners(engine)
+
     # Click pay button — search ALL frames, not just the ones we filled
     pay_clicked = False
     for frame in engine.page.frames:
@@ -2005,27 +2013,233 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
     if not pay_clicked:
         logger.error("Could not find/click RazorPay pay button in any frame")
 
-    await asyncio.sleep(8)
+    # Wait for payment to process — RazorPay needs time to call the bank,
+    # get a response, and either close the modal (success) or show an error
+    await asyncio.sleep(10)
 
-    # Parse the payment result from the final page
-    result = await _parse_payment_result(engine)
+    # Check if our injected listeners captured any events
+    captured_events = await _read_captured_razorpay_events(engine)
+    logger.info(f"Captured RazorPay events: {captured_events}")
+
+    # Parse the payment result from the final page + captured events
+    result = await _parse_payment_result(engine, captured_events)
     return result
 
 
-async def _parse_payment_result(engine: SiteEngine) -> dict:
+async def _inject_razorpay_event_listeners(engine: SiteEngine) -> None:
     """
-    Parse the final page after payment to extract order/payment details.
-    Extracts: order ID, order key, RazorPay payment ID, amount, status.
+    Inject JS into the main page to capture RazorPay checkout events.
+
+    RazorPay's Standard Checkout fires:
+    - handler(response) on success → response has razorpay_payment_id,
+      razorpay_order_id, razorpay_signature
+    - rzp1.on('payment.failed', ...) on decline → response.error has
+      code, description, source, step, reason, metadata
+
+    We store these in window.__rzp_events so we can read them later.
     """
+    try:
+        await engine.page.evaluate(
+            """() => {
+                // Storage for captured events
+                window.__rzp_events = {
+                    success: null,
+                    failure: null,
+                    dismiss: null,
+                };
+
+                // Try to find the RazorPay instance and hook into its events.
+                // RazorPay creates a global `rzp1` or similar instance.
+                const hookRzp = (rzp) => {
+                    try {
+                        if (rzp && typeof rzp.on === 'function') {
+                            rzp.on('payment.failed', function(resp) {
+                                window.__rzp_events.failure = {
+                                    code: resp && resp.error && resp.error.code || '',
+                                    description: resp && resp.error && resp.error.description || '',
+                                    source: resp && resp.error && resp.error.source || '',
+                                    step: resp && resp.error && resp.error.step || '',
+                                    reason: resp && resp.error && resp.error.reason || '',
+                                    order_id: resp && resp.error && resp.error.metadata && resp.error.metadata.order_id || '',
+                                    payment_id: resp && resp.error && resp.error.metadata && resp.error.metadata.payment_id || '',
+                                    timestamp: Date.now(),
+                                };
+                                console.log('[RZP] payment.failed captured:', window.__rzp_events.failure);
+                            });
+                        }
+                        if (rzp && typeof rzp.on === 'function') {
+                            rzp.on('payment.success' in rzp ? 'payment.success' : 'payment.authorized', function(resp) {
+                                window.__rzp_events.success = {
+                                    payment_id: resp && (resp.razorpay_payment_id || resp.id) || '',
+                                    order_id: resp && (resp.razorpay_order_id || resp.order_id) || '',
+                                    signature: resp && resp.razorpay_signature || '',
+                                    timestamp: Date.now(),
+                                };
+                                console.log('[RZP] payment.success captured:', window.__rzp_events.success);
+                            });
+                        }
+                        // Modal dismiss
+                        if (rzp && rzp.options && typeof rzp.options.modal === 'object') {
+                            const origDismiss = rzp.options.modal.ondismiss;
+                            rzp.options.modal.ondismiss = function(reason) {
+                                window.__rzp_events.dismiss = {
+                                    reason: typeof reason === 'string' ? reason : 'unknown',
+                                    timestamp: Date.now(),
+                                };
+                                console.log('[RZP] modal dismissed:', reason);
+                                if (typeof origDismiss === 'function') return origDismiss(reason);
+                            };
+                        }
+                        return true;
+                    } catch (e) {
+                        console.log('[RZP] hook error:', e);
+                        return false;
+                    }
+                };
+
+                // Try common global variable names
+                const candidates = ['rzp1', 'rzp', 'razorpay', 'Razorpay'];
+                for (const name of candidates) {
+                    if (window[name]) {
+                        if (hookRzp(window[name])) {
+                            console.log('[RZP] hooked instance:', name);
+                            return;
+                        }
+                    }
+                }
+
+                // If no global instance found, watch for it via Object.defineProperty
+                let hooked = false;
+                for (const name of candidates) {
+                    let _val = window[name];
+                    try {
+                        Object.defineProperty(window, name, {
+                            configurable: true,
+                            get() { return _val; },
+                            set(v) {
+                                _val = v;
+                                if (!hooked && v) {
+                                    hooked = hookRzp(v);
+                                    if (hooked) console.log('[RZP] hooked late instance:', name);
+                                }
+                            },
+                        });
+                    } catch (e) {}
+                }
+
+                console.log('[RZP] event listeners injected');
+            }"""
+        )
+        logger.info("RazorPay event listeners injected")
+    except Exception as e:
+        logger.warning(f"Could not inject RazorPay event listeners: {e}")
+
+
+async def _read_captured_razorpay_events(engine: SiteEngine) -> dict:
+    """Read events captured by _inject_razorpay_event_listeners."""
+    try:
+        events = await engine.page.evaluate(
+            "() => window.__rzp_events || {success: null, failure: null, dismiss: null}"
+        )
+        return events or {"success": null, "failure": null, "dismiss": null}
+    except Exception as e:
+        logger.warning(f"Could not read captured RazorPay events: {e}")
+        return {"success": null, "failure": null, "dismiss": null}
+
+
+# RazorPay error reason codes → user-friendly messages
+# Based on official RazorPay error documentation (~90 codes)
+RZP_REASON_MESSAGES = {
+    # Card declines
+    "card_declined":              "Card was declined by the bank",
+    "payment_declined":           "Payment was declined",
+    "payment_declined_due_to_high_traffic": "Payment declined due to high traffic — try again",
+    "debit_declined":             "Debit transaction was declined",
+    "credit_limit_exceeded":      "Credit limit exceeded on the card",
+    "credit_not_permitted":       "Credit transaction not permitted on this card",
+    "authorisation_declined_by_psp": "Authorization declined by payment processor",
+    "issuer_technical_error":     "Card-issuing bank had a technical error",
+    "gateway_technical_error":    "Payment gateway had a technical error",
+    "invalid_response_from_gateway": "Invalid response from payment gateway",
+    # Card detail errors
+    "card_expired":               "Card has expired",
+    "card_number_invalid":        "Invalid card number",
+    "card_type_invalid":          "This card type is not supported",
+    "card_not_enrolled":          "Card is not enrolled for this transaction",
+    "incorrect_card_details":     "Incorrect card details entered",
+    "incorrect_card_expiry_date": "Incorrect card expiry date",
+    "incorrect_cardholder_name":  "Incorrect cardholder name",
+    "incorrect_cvv":              "Incorrect CVV",
+    "debit_instrument_blocked":   "This debit instrument is blocked",
+    # Authentication failures
+    "authentication_failed":      "3D Secure authentication failed",
+    "incorrect_otp":              "Incorrect OTP entered",
+    "otp_attempts_exceeded":      "Too many wrong OTP attempts",
+    "otp_expired":                "OTP expired — try again",
+    "payment_authentication":     "Payment authentication failed",
+    # Funds / limits
+    "insufficient_funds":         "Insufficient funds in account",
+    "transaction_daily_limit_exceeded": "Daily transaction limit exceeded",
+    "transaction_limit_exceeded": "Transaction limit exceeded",
+    # Processing errors
+    "payment_failed":             "Payment processing failed",
+    "payment_cancelled":          "Payment was cancelled",
+    "payment_risk_check_failed":  "Payment blocked by risk check",
+    "payment_timed_out":          "Payment timed out — try again",
+    "payment_pending":            "Payment is pending at the bank",
+    "payment_session_expired":    "Payment session expired — try again",
+    "request_timed_out":          "Request timed out",
+    "server_error":               "RazorPay server error — try again",
+    # Bank errors
+    "bank_technical_error":       "Bank had a technical error",
+    "bank_account_invalid":       "Invalid bank account",
+    # Validation
+    "input_validation_failed":    "Input validation failed",
+    "invalid_order_id":           "Invalid order ID",
+    "order_already_paid":         "Order was already paid",
+    "live_mode_not_enabled":      "Live mode not enabled on account",
+}
+
+# Error code → status mapping
+RZP_ERROR_CODE_STATUS = {
+    "BAD_REQUEST_ERROR": "failed",
+    "GATEWAY_ERROR":     "failed",
+    "SERVER_ERROR":      "failed",
+}
+
+
+async def _parse_payment_result(engine: SiteEngine, captured_events: dict = None) -> dict:
+    """
+    Parse the final page after payment to extract order/payment details AND
+    determine the authoritative payment status.
+
+    Uses multiple detection signals (in priority order):
+    1. Captured RazorPay JS events (most authoritative — from handler/payment.failed)
+    2. RazorPay checkout modal state (still open = declined, closed = approved)
+    3. Final URL patterns (order-received = success)
+    4. Page content markers (thank you, payment failed, etc.)
+    5. RazorPay payment ID presence (pay_XXX = success signal)
+    6. WooCommerce error/notices
+
+    Extracts: order ID, order key, payment ID, amount, status, decline reason.
+    """
+    if captured_events is None:
+        captured_events = {"success": None, "failure": None, "dismiss": None}
+
     result = {
         "status": "unknown",
+        "status_text": "",
         "order_id": "",
         "order_key": "",
         "payment_id": "",
         "amount": "",
-        "status_text": "",
+        "currency": "",
         "url": "",
         "message": "",
+        "decline_reason": "",
+        "decline_code": "",
+        "error_source": "",
+        "error_step": "",
     }
 
     try:
@@ -2033,9 +2247,7 @@ async def _parse_payment_result(engine: SiteEngine) -> dict:
         result["url"] = final_url
         logger.info(f"Parsing payment result from URL: {final_url}")
 
-        # Extract order ID from URL patterns:
-        #   order-received/12345/?key=wc_order_XXX
-        #   order-pay/12345/?key=wc_order_XXX
+        # Extract order ID + key from URL
         order_match = re.search(r'order-(?:received|pay)/(\d+)', final_url, re.I)
         if order_match:
             result["order_id"] = order_match.group(1)
@@ -2043,6 +2255,11 @@ async def _parse_payment_result(engine: SiteEngine) -> dict:
         key_match = re.search(r'key=(wc_order_\w+)', final_url, re.I)
         if key_match:
             result["order_key"] = key_match.group(1)
+
+        # Also check URL query params for razorpay_payment_id (redirect flow)
+        rzp_url_match = re.search(r'[?&]razorpay_payment_id=(pay_\w+)', final_url, re.I)
+        if rzp_url_match and not result["payment_id"]:
+            result["payment_id"] = rzp_url_match.group(1)
 
         # Get page content + visible text
         content = await engine._safe_get_content()
@@ -2054,34 +2271,18 @@ async def _parse_payment_result(engine: SiteEngine) -> dict:
         text_lower = text.lower()
         content_lower = content.lower()
 
-        # Determine payment status from URL + content
-        if "order-received" in final_url.lower():
-            result["status"] = "success"
-            result["status_text"] = "Payment Successful"
-        elif "thank" in text_lower and "order" in text_lower:
-            result["status"] = "success"
-            result["status_text"] = "Payment Successful"
-        elif any(x in text_lower for x in ["payment failed", "transaction failed",
-                                            "payment declined", "card declined"]):
-            result["status"] = "failed"
-            result["status_text"] = "Payment Failed"
-        elif "pending" in text_lower and "payment" in text_lower:
-            result["status"] = "pending"
-            result["status_text"] = "Payment Pending"
-
-        # Extract RazorPay payment ID (patterns: pay_XXX, rp_XXX, rzp_XXX)
-        rzp_match = re.search(r'(pay_[A-Za-z0-9]{10,}|rp_[A-Za-z0-9]{10,}|rzp_[A-Za-z0-9]{10,})', content)
-        if rzp_match:
-            result["payment_id"] = rzp_match.group(1)
-
-        # Also try from visible text
+        # Extract RazorPay payment ID from page (pay_XXX format, 10-14 chars after prefix)
         if not result["payment_id"]:
-            rzp_match = re.search(r'(pay_[A-Za-z0-9]{10,}|rp_[A-Za-z0-9]{10,})', text)
+            rzp_match = re.search(r'\b(pay_[A-Za-z0-9]{10,14})\b', content)
+            if rzp_match:
+                result["payment_id"] = rzp_match.group(1)
+        if not result["payment_id"]:
+            rzp_match = re.search(r'\b(pay_[A-Za-z0-9]{10,14})\b', text)
             if rzp_match:
                 result["payment_id"] = rzp_match.group(1)
 
         # Extract amount (₹, Rs, INR, $, etc.)
-        amount_match = re.search(r'(?:₹|Rs\.?\s*|INR\s*|\$)\s*([\d,]+\.?\d*)', text)
+        amount_match = re.search(r'(?:₹|Rs\.?\s*|INR\s*|\$|€|£)\s*([\d,]+\.?\d*)', text)
         if amount_match:
             result["amount"] = amount_match.group(1)
 
@@ -2091,49 +2292,249 @@ async def _parse_payment_result(engine: SiteEngine) -> dict:
             if order_num_match:
                 result["order_id"] = order_num_match.group(1)
 
-        # Extract WooCommerce error/notices
-        errors = re.findall(
-            r'<ul[^>]*class="[^"]*error[^"]*"[^>]*>(.*?)</ul>',
-            content, re.DOTALL | re.I
-        )
-        if errors:
-            error_text = re.sub(r"<[^>]*>", "", errors[0]).strip()
-            result["message"] = error_text[:300]
-            if result["status"] in ("unknown", ""):
-                result["status"] = "failed"
-                result["status_text"] = "Payment Error"
+        # ==================================================================
+        # SIGNAL 1: Captured RazorPay JS events (MOST AUTHORITATIVE)
+        # ==================================================================
+        if captured_events.get("failure"):
+            # payment.failed event fired — definitive decline
+            fail = captured_events["failure"]
+            result["status"] = "failed"
+            result["status_text"] = "Payment Declined"
+            result["decline_code"] = fail.get("code", "")
+            result["decline_reason"] = fail.get("reason", "")
+            result["error_source"] = fail.get("source", "")
+            result["error_step"] = fail.get("step", "")
+            if fail.get("payment_id"):
+                result["payment_id"] = result["payment_id"] or fail["payment_id"]
+            # Map reason code to user-friendly message
+            reason = fail.get("reason", "")
+            desc = fail.get("description", "")
+            if reason in RZP_REASON_MESSAGES:
+                result["message"] = RZP_REASON_MESSAGES[reason]
+            elif desc:
+                result["message"] = desc
+            else:
+                result["message"] = f"Payment declined ({reason or 'unknown reason'})"
+            logger.info(f"Payment DECLINED via JS event: code={result['decline_code']}, reason={reason}")
+            return _finalize_result(result)
 
-        # Also check for woocommerce-notice messages
-        if not result["message"]:
-            notices = re.findall(
-                r'<div[^>]*class="[^"]*woocommerce-notice[^"]*"[^>]*>(.*?)</div>',
+        if captured_events.get("success"):
+            # handler(response) fired — definitive success
+            succ = captured_events["success"]
+            result["status"] = "success"
+            result["status_text"] = "Payment Approved"
+            if succ.get("payment_id"):
+                result["payment_id"] = result["payment_id"] or succ["payment_id"]
+            if succ.get("order_id") and not result["order_id"]:
+                result["order_id"] = succ["order_id"]
+            result["message"] = "Payment completed successfully."
+            logger.info(f"Payment APPROVED via JS event: payment_id={result['payment_id']}")
+            return _finalize_result(result)
+
+        # ==================================================================
+        # SIGNAL 2: RazorPay modal state (still open = likely declined)
+        # ==================================================================
+        modal_still_open = False
+        try:
+            modal_check = await engine.page.evaluate(
+                """() => {
+                    // RazorPay modal selectors
+                    const selectors = [
+                        '#razorpay-payment-container',
+                        '.razorpay-container',
+                        'iframe[name*="razorpay"]',
+                        'iframe[src*="checkout.razorpay.com"]',
+                        'iframe[src*="api.razorpay.com/v1/checkout"]',
+                    ];
+                    for (const sel of selectors) {
+                        const el = document.querySelector(sel);
+                        if (el && el.offsetParent !== null) return {open: true, selector: sel};
+                    }
+                    return {open: false, selector: null};
+                }"""
+            )
+            modal_still_open = modal_check.get("open", False) if modal_check else False
+            if modal_still_open:
+                logger.info(f"RazorPay modal still open: {modal_check.get('selector')}")
+        except Exception as e:
+            logger.warning(f"Could not check modal state: {e}")
+
+        # Look for in-modal error message if modal is still open
+        in_modal_error = ""
+        if modal_still_open:
+            try:
+                # Search all RazorPay frames for error text
+                for frame in engine.page.frames:
+                    if "razorpay" not in (frame.url or "").lower():
+                        continue
+                    try:
+                        err_text = await frame.evaluate(
+                            """() => {
+                                // RazorPay shows error in elements with these patterns
+                                const errorEls = document.querySelectorAll(
+                                    '[class*="error"], [class*="Error"], [role="alert"], ' +
+                                    '.text-red, .text-danger, .rzp-error, [data-error]'
+                                );
+                                for (const el of errorEls) {
+                                    const t = (el.textContent || '').trim();
+                                    if (t && t.length > 5 && t.length < 200 && el.offsetParent !== null) {
+                                        return t;
+                                    }
+                                }
+                                return '';
+                            }"""
+                        )
+                        if err_text:
+                            in_modal_error = err_text
+                            logger.info(f"In-modal error text: {err_text}")
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # ==================================================================
+        # SIGNAL 3: Final URL patterns
+        # ==================================================================
+        url_success = "order-received" in final_url.lower()
+
+        # ==================================================================
+        # SIGNAL 4: Page content markers
+        # ==================================================================
+        content_markers = {
+            "success": ["thank you", "order received", "order confirmed",
+                       "payment successful", "payment complete", "payment done",
+                       "thank you for your order", "your order is complete",
+                       "payment success", "transaction success"],
+            "failed":  ["payment failed", "transaction failed", "payment declined",
+                       "card declined", "payment unsuccessful", "transaction declined",
+                       "payment was declined", "your card was declined",
+                       "payment could not be processed", "transaction cannot be processed"],
+            "pending": ["payment pending", "transaction pending", "awaiting confirmation",
+                       "payment is being processed"],
+        }
+
+        detected_status = "unknown"
+        for marker in content_markers["success"]:
+            if marker in text_lower:
+                detected_status = "success"
+                break
+        if detected_status == "unknown":
+            for marker in content_markers["failed"]:
+                if marker in text_lower:
+                    detected_status = "failed"
+                    break
+        if detected_status == "unknown":
+            for marker in content_markers["pending"]:
+                if marker in text_lower:
+                    detected_status = "pending"
+                    break
+
+        # ==================================================================
+        # DECISION LOGIC — combine all signals
+        # ==================================================================
+        if url_success:
+            result["status"] = "success"
+            result["status_text"] = "Payment Approved"
+            result["message"] = "Payment completed successfully."
+        elif detected_status == "success":
+            result["status"] = "success"
+            result["status_text"] = "Payment Approved"
+            result["message"] = "Payment completed successfully."
+        elif detected_status == "failed":
+            result["status"] = "failed"
+            result["status_text"] = "Payment Declined"
+            result["message"] = "Payment was declined or failed."
+        elif detected_status == "pending":
+            result["status"] = "pending"
+            result["status_text"] = "Payment Pending"
+            result["message"] = "Payment is pending. Check your bank."
+        elif modal_still_open and in_modal_error:
+            # Modal still open + error text visible = declined
+            result["status"] = "failed"
+            result["status_text"] = "Payment Declined"
+            result["message"] = in_modal_error
+            # Try to match against known reason patterns
+            err_lower = in_modal_error.lower()
+            reason_map = {
+                "card_declined":              ["card declined", "card was declined", "your card was declined"],
+                "insufficient_funds":         ["insufficient funds", "insufficient balance"],
+                "authentication_failed":      ["authentication failed", "3d secure", "3ds"],
+                "incorrect_cvv":              ["incorrect cvv", "invalid cvv", "wrong cvv"],
+                "card_expired":               ["card expired", "expired card"],
+                "payment_timed_out":          ["timed out", "timeout"],
+                "payment_cancelled":          ["cancelled", "canceled"],
+            }
+            for reason, patterns in reason_map.items():
+                if any(p in err_lower for p in patterns):
+                    result["decline_reason"] = reason
+                    result["message"] = RZP_REASON_MESSAGES.get(reason, in_modal_error)
+                    break
+        elif modal_still_open:
+            # Modal still open but no error text yet — likely still processing or failed silently
+            result["status"] = "failed"
+            result["status_text"] = "Payment Declined"
+            result["message"] = "Payment was declined or cancelled. Modal remained open."
+        elif result["payment_id"]:
+            # No explicit success markers, but a payment ID exists — treat as success
+            result["status"] = "success"
+            result["status_text"] = "Payment Approved"
+            result["message"] = "Payment completed successfully."
+        else:
+            # Fallback — check for WooCommerce error notices
+            errors = re.findall(
+                r'<ul[^>]*class="[^"]*error[^"]*"[^>]*>(.*?)</ul>',
                 content, re.DOTALL | re.I
             )
-            if notices:
-                notice_text = re.sub(r"<[^>]*>", "", notices[0]).strip()
-                result["message"] = notice_text[:300]
-
-        # Set default message based on status if none found
-        if not result["message"]:
-            if result["status"] == "success":
-                result["message"] = "Payment completed successfully."
-            elif result["status"] == "failed":
-                result["message"] = "Payment was declined or failed."
-            elif result["status"] == "pending":
-                result["message"] = "Payment is pending. Check your bank."
+            if errors:
+                error_text = re.sub(r"<[^>]*>", "", errors[0]).strip()
+                result["status"] = "failed"
+                result["status_text"] = "Payment Error"
+                result["message"] = error_text[:300]
             else:
-                result["message"] = "Payment submitted. Verify manually."
+                notices = re.findall(
+                    r'<div[^>]*class="[^"]*woocommerce-notice[^"]*"[^>]*>(.*?)</div>',
+                    content, re.DOTALL | re.I
+                )
+                if notices:
+                    notice_text = re.sub(r"<[^>]*>", "", notices[0]).strip()
+                    result["message"] = notice_text[:300]
+                    if "success" in notice_text.lower() or "received" in notice_text.lower():
+                        result["status"] = "success"
+                        result["status_text"] = "Payment Approved"
+                    else:
+                        result["status"] = "needs_review"
+                        result["status_text"] = "Needs Review"
+                else:
+                    result["status"] = "needs_review"
+                    result["status_text"] = "Needs Review"
+                    result["message"] = "Payment submitted. Verify manually."
 
         logger.info(
             f"Payment result: status={result['status']}, order_id={result['order_id']}, "
-            f"payment_id={result['payment_id']}, amount={result['amount']}"
+            f"payment_id={result['payment_id']}, amount={result['amount']}, "
+            f"decline_reason={result['decline_reason']}"
         )
 
     except Exception as e:
         logger.error(f"Error parsing payment result: {e}", exc_info=True)
         result["status"] = "needs_review"
+        result["status_text"] = "Parse Error"
         result["message"] = f"Could not parse payment result: {str(e)[:100]}"
 
+    return _finalize_result(result)
+
+
+def _finalize_result(result: dict) -> dict:
+    """Ensure all required keys are present in the result dict."""
+    required_keys = [
+        "status", "status_text", "order_id", "order_key", "payment_id",
+        "amount", "currency", "url", "message", "decline_reason",
+        "decline_code", "error_source", "error_step",
+    ]
+    for key in required_keys:
+        if key not in result:
+            result[key] = ""
     return result
 
 

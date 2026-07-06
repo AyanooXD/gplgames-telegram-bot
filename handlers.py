@@ -641,6 +641,10 @@ async def process_cvv(message: Message, state: FSMContext) -> None:
     amount = result.get("amount", "")
     status_text = result.get("status_text", "")
     url = result.get("url", "")
+    decline_reason = result.get("decline_reason", "")
+    decline_code = result.get("decline_code", "")
+    error_source = result.get("error_source", "")
+    error_step = result.get("error_step", "")
 
     # Build detailed payment result message
     if status == "success":
@@ -660,7 +664,7 @@ async def process_cvv(message: Message, state: FSMContext) -> None:
         url_line = f"\n\n🔗 <a href=\"{html.escape(url)}\">View Order</a>" if url else ""
 
         response_text = (
-            "✅ <b>Payment Completed</b>\n\n"
+            "✅ <b>Payment Approved</b>\n\n"
             f"{details_block}"
             f"{url_line}\n\n"
             "<i>📧 Check your email for confirmation.</i>"
@@ -692,13 +696,30 @@ async def process_cvv(message: Message, state: FSMContext) -> None:
             "<i>Check your bank app or email for updates.</i>"
         )
     else:
+        # Failed/declined — show decline reason if we have it
+        details_lines = []
+        if decline_reason:
+            details_lines.append(f"🔍 <b>Reason Code:</b> <code>{html.escape(decline_reason)}</code>")
+        if decline_code:
+            details_lines.append(f"⚠️ <b>Error Code:</b> <code>{html.escape(decline_code)}</code>")
+        if error_source:
+            details_lines.append(f"📍 <b>Source:</b> <code>{html.escape(error_source)}</code>")
+        if error_step:
+            details_lines.append(f"🔀 <b>Step:</b> <code>{html.escape(error_step)}</code>")
+        if payment_id:
+            details_lines.append(f"💳 <b>Failed Payment ID:</b> <code>{html.escape(payment_id)}</code>")
+
+        details_block = "\n".join(details_lines) if details_lines else ""
+        details_block = "\n" + details_block + "\n\n" if details_block else "\n"
+
         response_text = (
-            "❌ <b>Payment Failed</b>\n\n"
-            f"💬 {html.escape(msg)}\n\n"
-            "💡 <b>Possible reasons:</b>\n"
-            "• Invalid card details\n"
-            "• Card declined by bank\n"
-            "• RazorPay gateway issue\n\n"
+            "❌ <b>Payment Declined</b>\n\n"
+            f"💬 {html.escape(msg)}"
+            f"{details_block}"
+            "💡 <b>What to do:</b>\n"
+            "• Check card details are correct\n"
+            "• Try a different card\n"
+            "• Contact your bank if decline persists\n\n"
             "<i>Send <code>/seturl</code> to try again</i>"
         )
 
