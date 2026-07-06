@@ -1546,7 +1546,10 @@ async def _dump_razorpay_frames(engine: SiteEngine) -> None:
             inputs = await frame.evaluate(
                 """() => {
                     const out = [];
-                    for (const el of document.querySelectorAll('input, button, [role="textbox"], iframe')) {
+                    for (const el of document.querySelectorAll('input, button, [role="textbox"], iframe, [role="radio"], label, div')) {
+                        // Only log elements with useful info to avoid spam
+                        const txt = (el.textContent || '').trim().substring(0, 60);
+                        if (!el.name && !el.id && !el.placeholder && !el.type && !txt && !el.getAttribute('aria-label')) continue;
                         out.push({
                             tag: el.tagName.toLowerCase(),
                             type: el.type || '',
@@ -1557,6 +1560,9 @@ async def _dump_razorpay_frames(engine: SiteEngine) -> None:
                             visible: el.offsetParent !== null,
                             ariaLabel: el.getAttribute('aria-label') || '',
                             autocomplete: el.autocomplete || '',
+                            text: txt,
+                            role: el.getAttribute('role') || '',
+                            cls: (el.className || '').toString().substring(0, 80),
                         });
                     }
                     return out;
@@ -1566,6 +1572,84 @@ async def _dump_razorpay_frames(engine: SiteEngine) -> None:
                 logger.info(f"    {inp}")
         except Exception as e:
             logger.info(f"    (could not read frame: {e})")
+
+
+async def _click_card_payment_method(engine: SiteEngine) -> bool:
+    """
+    On RazorPay's initial screen, click the 'Card' payment method option
+    to reveal the card number/expiry/CVV input fields.
+
+    Returns True if the Card option was found and clicked.
+    """
+    razorpay_frames = [f for f in engine.page.frames if "razorpay" in (f.url or "").lower()]
+    logger.info(f"Looking for 'Card' payment method in {len(razorpay_frames)} frame(s)")
+
+    for frame in razorpay_frames:
+        try:
+            # Strategy 1: Click by text "Card" (most reliable)
+            # RazorPay shows payment methods as clickable labels/buttons
+            for text in ["Card", "CARD", "Credit Card", "Debit Card", "Credit/Debit Card"]:
+                try:
+                    card_btn = frame.locator(f'text="{text}"')
+                    count = await card_btn.count()
+                    if count > 0:
+                        logger.info(f"Found '{text}' payment method ({count} matches), clicking first visible...")
+                        for i in range(count):
+                            try:
+                                el = card_btn.nth(i)
+                                if await el.is_visible(timeout=1500):
+                                    await el.click()
+                                    logger.info(f"Clicked '{text}' payment method (match #{i})")
+                                    await asyncio.sleep(2)  # Wait for card form to slide in
+                                    return True
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+
+            # Strategy 2: Click the radio button whose label/sibling says "Card"
+            try:
+                # Look for labels containing "Card" and click them
+                card_label = frame.locator('label:has-text("Card"), [role="radio"]:has-text("Card")')
+                count = await card_label.count()
+                if count > 0:
+                    for i in range(count):
+                        try:
+                            el = card_label.nth(i)
+                            if await el.is_visible(timeout=1500):
+                                await el.click()
+                                logger.info(f"Clicked Card label/radio (match #{i})")
+                                await asyncio.sleep(2)
+                                return True
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            # Strategy 3: Click by aria-label
+            try:
+                card_aria = frame.locator('[aria-label*="Card" i], [aria-label*="card" i]')
+                count = await card_aria.count()
+                if count > 0:
+                    for i in range(count):
+                        try:
+                            el = card_aria.nth(i)
+                            if await el.is_visible(timeout=1500):
+                                await el.click()
+                                logger.info(f"Clicked Card aria-labeled element (match #{i})")
+                                await asyncio.sleep(2)
+                                return True
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.warning(f"Error searching for Card method in frame: {e}")
+            continue
+
+    logger.error("Could not find 'Card' payment method in any RazorPay frame")
+    return False
 
 
 async def _find_card_input_in_frame(frame, field_type: str = "number") -> any:
@@ -1679,6 +1763,13 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
 
     Handles both old (single iframe with all fields) and new (separate
     iframes per card field) RazorPay UI layouts.
+
+    RazorPay's flow:
+    1. Modal opens with payment method selection (Card, UPI, Netbanking, etc.)
+       — only radio buttons + labels are visible, NO card input fields
+    2. User clicks "Card" → card input fields slide in (may be in new iframes)
+    3. User fills card number, expiry, CVV
+    4. User clicks Pay
     """
     await engine.on_status("💳 RazorPay modal found! Entering card details...")
     cc = engine._cc
@@ -1686,30 +1777,55 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
     # Wait for modal to fully load — RazorPay loads iframes asynchronously
     await asyncio.sleep(3)
 
-    # Diagnostic dump
+    # Initial diagnostic dump (shows payment method selection state)
     await _dump_razorpay_frames(engine)
 
+    # ------------------------------------------------------------------
+    # STEP 1: Click the "Card" payment method to reveal card input fields.
+    # On RazorPay's initial screen, you see radio buttons for Card/UPI/etc
+    # but NO card input fields. We must click "Card" first.
+    # ------------------------------------------------------------------
+    await engine.on_status("💳 Selecting Card payment method...")
+
+    # Check if card input fields already exist (skip Card click if so)
+    card_input_already_visible = False
+    for frame in engine.page.frames:
+        if "razorpay" not in (frame.url or "").lower():
+            continue
+        if await _find_card_input_in_frame(frame, "number") is not None:
+            card_input_already_visible = True
+            logger.info("Card input already visible — skipping Card method click")
+            break
+
+    if not card_input_already_visible:
+        clicked = await _click_card_payment_method(engine)
+        if not clicked:
+            # Maybe the modal already shows card fields but we couldn't detect
+            # them, OR the UI is different. Try to fill anyway.
+            logger.warning("Could not click Card payment method — trying to fill anyway")
+
+        # Wait for card form to load (new iframes may be created)
+        await asyncio.sleep(3)
+
+        # Re-dump frames AFTER clicking Card — this shows the actual card
+        # input fields (which appear in new iframes after Card is selected)
+        logger.info("=== RAZORPAY FRAME DUMP AFTER CLICKING CARD ===")
+        await _dump_razorpay_frames(engine)
+
+    # ------------------------------------------------------------------
+    # STEP 2: Fill the card number, expiry, CVV fields.
+    # ------------------------------------------------------------------
     filled_card = False
     filled_exp = False
     filled_cvv = False
 
-    # First, try the OLD layout: single iframe with all card fields
     razorpay_frames = [f for f in engine.page.frames if "razorpay" in (f.url or "").lower()]
-    logger.info(f"Found {len(razorpay_frames)} RazorPay frame(s)")
+    logger.info(f"Found {len(razorpay_frames)} RazorPay frame(s) for filling")
 
     for frame in razorpay_frames:
         if filled_card and filled_exp and filled_cvv:
             break
         try:
-            # Click "Card" tab if visible (some RazorPay UIs show payment method tabs)
-            try:
-                card_tab = frame.locator('text="Card"')
-                if await card_tab.count() > 0:
-                    await card_tab.first.click()
-                    await asyncio.sleep(1)
-            except Exception:
-                pass
-
             # Try to fill card number
             if not filled_card:
                 card_input = await _find_card_input_in_frame(frame, "number")
@@ -1768,16 +1884,18 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
         return {
             "status": "error",
             "message": (
-                "Could not find the card number field in RazorPay. "
-                "RazorPay may have updated their UI. "
-                "Please check /logs/live_issues.log for the frame dump."
+                "Could not find the card number field in RazorPay even after "
+                "clicking the Card payment method. RazorPay may have updated "
+                "their UI. Please check logs/bot_full.log for the frame dump."
             ),
         }
 
+    # Retry pass for expiry/CVV if not filled (iframes may still be loading)
     if not filled_exp or not filled_cvv:
         logger.warning(f"Missing: expiry={not filled_exp}, cvv={not filled_cvv}")
-        # Try one more time with a longer wait — iframes may still be loading
         await asyncio.sleep(2)
+        # Refresh frame list (new iframes may have appeared)
+        razorpay_frames = [f for f in engine.page.frames if "razorpay" in (f.url or "").lower()]
         for frame in razorpay_frames:
             if not filled_exp:
                 exp_input = await _find_card_input_in_frame(frame, "expiry")
