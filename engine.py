@@ -343,7 +343,7 @@ class SiteEngine:
                 # expect_navigation timed out — callback may have failed silently
                 await asyncio.sleep(2)
 
-            if "Bot Verification" not in await page.content():
+            if "Bot Verification" not in await self._safe_page_content(page):
                 await self.on_status("✅ Verification passed!")
                 return True
 
@@ -396,7 +396,7 @@ class SiteEngine:
             except Exception:
                 await asyncio.sleep(3)
 
-            if "Bot Verification" not in await page.content():
+            if "Bot Verification" not in await self._safe_page_content(page):
                 await self.on_status("✅ Verification passed!")
                 return True
 
@@ -436,7 +436,7 @@ class SiteEngine:
             except Exception:
                 await asyncio.sleep(3)
 
-            if "Bot Verification" not in await page.content():
+            if "Bot Verification" not in await self._safe_page_content(page):
                 await self.on_status("✅ Verification passed!")
                 return True
 
@@ -448,7 +448,7 @@ class SiteEngine:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(3)
-            if "Bot Verification" not in await page.content():
+            if "Bot Verification" not in await self._safe_page_content(page):
                 await self.on_status("✅ Verification passed!")
                 return True
         except Exception:
@@ -463,7 +463,7 @@ class SiteEngine:
         and inject the token to get past it. Then navigate to the actual URL.
         Returns True if we end up on the real page (not verification).
         """
-        content = await page.content()
+        content = await self._safe_page_content(page)
         if "Bot Verification" not in content:
             return True  # No verification needed
 
@@ -519,14 +519,70 @@ class SiteEngine:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
 
-            content = await self.page.content()
+            content = await self._safe_get_content()
             if "Bot Verification" in content:
-                return await self._solve_captcha_and_navigate(self.page, url)
+                passed = await self._solve_captcha_and_navigate(self.page, url)
+                if not passed:
+                    return False
+
+                # CRITICAL: After captcha solving, the page may be on a
+                # different URL (verification success page, homepage, or
+                # mid-redirect). Re-navigate to the originally requested URL
+                # so the caller gets a stable page on the right URL.
+                try:
+                    await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2)
+                    # Confirm we're not back on the verification page
+                    post_content = await self._safe_get_content()
+                    if "Bot Verification" in post_content:
+                        logger.error("Still on verification page after re-navigation")
+                        await self.on_status("❌ Captcha solved but page redirected back. Try /cookies instead.")
+                        return False
+                except Exception as e:
+                    logger.error(f"Post-captcha navigation to {url} failed: {e}")
+                    await self.on_status("❌ Could not reach target page after captcha. Try /cookies instead.")
+                    return False
 
             return True
         except Exception as e:
             logger.error(f"Page load error for {url}: {e}")
             return False
+
+    async def _safe_get_content(self, max_retries: int = 4) -> str:
+        """
+        Get page.content() with retries — handles the case where the page is
+        mid-navigation and Playwright throws
+        "Unable to retrieve content because the page is navigating and changing the content."
+
+        This is the #1 cause of false "Login failed" errors after captcha solving.
+        """
+        return await self._safe_page_content(self.page, max_retries)
+
+    @staticmethod
+    async def _safe_page_content(page: Page, max_retries: int = 4) -> str:
+        """Static helper — same as _safe_get_content but for an arbitrary page."""
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                # Give any in-flight navigation time to settle first
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    # load state wait may itself time out during a slow redirect —
+                    # fall through and try content() anyway
+                    pass
+                return await page.content()
+            except Exception as e:
+                last_exc = e
+                msg = str(e).lower()
+                if "navigating" in msg or "changing the content" in msg:
+                    logger.debug(f"page.content() retry {attempt + 1}/{max_retries}: {e}")
+                    await asyncio.sleep(1.5)
+                    continue
+                # Different error — re-raise immediately
+                raise
+        # Exhausted retries — raise the last navigation error
+        raise last_exc
 
     # ================================================================
     # COOKIE IMPORT
@@ -565,7 +621,7 @@ class SiteEngine:
             if not ok:
                 return False
 
-            content = await self.page.content()
+            content = await self._safe_get_content()
             is_logged = "log out" in content.lower() or "logout" in content.lower()
             return is_logged
 
@@ -585,7 +641,7 @@ class SiteEngine:
             if not ok:
                 return False
 
-            content = await self.page.content()
+            content = await self._safe_get_content()
             if "woocommerce-login-nonce" not in content:
                 await self.on_status("❌ Login page did not load properly.")
                 return False
@@ -603,12 +659,17 @@ class SiteEngine:
             login_btn = self.page.locator('button[name="login"]')
             await login_btn.click()
 
+            # Wait for the post-login navigation. Don't use networkidle —
+            # gplgames.net has continuous polling that prevents it from firing.
+            # Use domcontentloaded (fires once after HTML is parsed) + a sleep
+            # so any post-login redirect can complete.
             try:
-                await self.page.wait_for_load_state("networkidle", timeout=15000)
+                await self.page.wait_for_load_state("domcontentloaded", timeout=15000)
             except Exception:
-                await asyncio.sleep(3)
+                pass
+            await asyncio.sleep(2)
 
-            content = await self.page.content()
+            content = await self._safe_get_content()
             is_logged = "log out" in content.lower() or "logout" in content.lower()
 
             if is_logged:
@@ -657,7 +718,7 @@ class SiteEngine:
                 ok = await self._ensure_page_loaded(product_url)
                 if not ok:
                     return False
-                content = await self.page.content()
+                content = await self._safe_get_content()
 
                 # Require BOTH a "post_type=product" hint AND an add-to-cart
                 # control to avoid false positives from category/shop pages.
@@ -684,7 +745,7 @@ class SiteEngine:
             if not ok:
                 return False
 
-            content = await self.page.content()
+            content = await self._safe_get_content()
 
             # Reject obvious non-product paths up front
             non_product_paths = ("/shop", "/cart", "/checkout", "/my-account", "/product-category")
@@ -768,7 +829,7 @@ class SiteEngine:
                 await add_btn.click()
                 await asyncio.sleep(3)
 
-                content = await self.page.content()
+                content = await self._safe_get_content()
                 lowered = content.lower()
                 if "has been added to your cart" in lowered or "added to cart" in lowered:
                     await self.on_status("✅ Product added to cart!")
@@ -780,7 +841,7 @@ class SiteEngine:
                     await self.on_status("❌ Could not verify cart (captcha block).")
                     return False
                 await asyncio.sleep(2)
-                cart_content = await self.page.content()
+                cart_content = await self._safe_get_content()
                 if "your cart is currently empty" not in cart_content.lower():
                     await self.on_status("✅ Product added to cart!")
                     return True
@@ -808,7 +869,7 @@ class SiteEngine:
             if not ok:
                 return {"error": "Could not load checkout (captcha block)", "nonce": "", "total": "", "html": ""}
 
-            content = await self.page.content()
+            content = await self._safe_get_content()
 
             if "Your cart is currently empty" in content:
                 return {"error": "Cart is empty", "nonce": "", "total": "", "html": ""}
@@ -927,7 +988,7 @@ class SiteEngine:
             await asyncio.sleep(5)
 
             current_url = self.page.url
-            content = await self.page.content()
+            content = await self._safe_get_content()
 
             if "order-received" in current_url:
                 return {"result": "success", "redirect": current_url, "messages": ""}
@@ -1205,7 +1266,7 @@ async def _check_login_status(self) -> bool:
         ok = await self._ensure_page_loaded(LOGIN_URL)
         if not ok:
             return False
-        content = await self.page.content()
+        content = await self._safe_get_content()
         return "log out" in content.lower() or "logout" in content.lower()
     except Exception:
         return False
@@ -1216,7 +1277,7 @@ async def _logout(self) -> None:
     try:
         ok = await self._ensure_page_loaded(f"{SITE_URL}/my-account/")
         if ok:
-            content = await self.page.content()
+            content = await self._safe_get_content()
             logout_match = re.search(r'href="([^"]*logout[^"]*)"', content)
             if logout_match:
                 logout_url = logout_match.group(1)
