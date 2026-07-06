@@ -1169,11 +1169,186 @@ class SiteEngine:
             logger.error(f"Checkout page error: {e}")
             return {"error": str(e), "nonce": "", "total": "", "html": ""}
 
-    async def fill_and_submit_checkout(self, billing: dict, nonce: str) -> dict:
-        """Fill billing fields and submit checkout via Playwright."""
-        await self.on_status("📦 Filling billing details...")
+    async def _read_existing_billing_fields(self) -> dict:
+        """
+        Read pre-filled billing values from the checkout form. Returns a dict
+        with whatever fields are already populated (empty values are skipped).
+
+        Works for both <input> fields (read .value) and <select> fields
+        (read the selected option's value).
+        """
+        try:
+            values = await self.page.evaluate(
+                """() => {
+                    const out = {};
+                    const fieldIds = [
+                        'billing_first_name', 'billing_last_name', 'billing_email',
+                        'billing_phone', 'billing_address_1', 'billing_city',
+                        'billing_state', 'billing_postcode', 'billing_country'
+                    ];
+                    for (const id of fieldIds) {
+                        const el = document.getElementById(id);
+                        if (!el) continue;
+                        let val = '';
+                        if (el.tagName.toLowerCase() === 'select') {
+                            val = el.value || (el.options[el.selectedIndex] ? el.options[el.selectedIndex].value : '');
+                        } else {
+                            val = el.value || '';
+                        }
+                        val = (val || '').trim();
+                        if (val) out[id] = val;
+                    }
+                    return out;
+                }"""
+            )
+            return values if values else {}
+        except Exception as e:
+            logger.warning(f"Could not read existing billing fields: {e}")
+            return {}
+
+    def _generate_random_billing(self, existing: dict | None = None) -> dict:
+        """
+        Generate realistic random Indian billing details for any fields that
+        are NOT already in `existing`. Used when the user doesn't provide
+        billing details manually.
+
+        Returns a dict with billing_* keys ready to be passed to
+        fill_and_submit_checkout().
+        """
+        import random
+        import string
+
+        existing = existing or {}
+        out = {}
+
+        # Indian first names (mix of common Hindu/Muslim/Sikh/Christian names)
+        first_names = [
+            "Aarav", "Vivaan", "Aditya", "Vihaan", "Arjun", "Sai", "Reyansh",
+            "Ayaan", "Krishna", "Ishaan", "Rahul", "Amit", "Suresh", "Rajesh",
+            "Ananya", "Aadhya", "Aaradhya", "Saanvi", "Priya", "Pooja", "Kavya",
+            "Diya", "Anika", "Navya", "Myra", "Anjali", "Deepa", "Sneha",
+        ]
+        last_names = [
+            "Sharma", "Verma", "Gupta", "Patel", "Singh", "Kumar", "Reddy",
+            "Nair", "Iyer", "Mehta", "Joshi", "Agarwal", "Bhat", "Rao",
+            "Das", "Banerjee", "Chatterjee", "Mukherjee", "Khan", "Ali",
+        ]
+
+        # Indian cities with their states and pincodes (real, valid combos)
+        locations = [
+            ("Mumbai",    "MH", "400001"),  # Fort, Mumbai
+            ("Delhi",     "DL", "110001"),  # Connaught Place
+            ("Bengaluru", "KA", "560001"),  # MG Road
+            ("Hyderabad", "TG", "500001"),  # Charminar
+            ("Chennai",   "TN", "600001"),  # Parry's Corner
+            ("Kolkata",   "WB", "700001"),  # BBD Bagh
+            ("Pune",      "MH", "411001"),  # Pune City
+            ("Ahmedabad", "GJ", "380001"),  # Kolkata
+            ("Jaipur",    "RJ", "302001"),  # Jaipur City
+            ("Lucknow",   "UP", "226001"),  # Hazratganj
+            ("Chandigarh","CH", "160001"),  # Sector 1
+            ("Indore",    "MP", "452001"),  # Indore City
+            ("Surat",     "GJ", "395001"),  # Surat City
+            ("Nagpur",    "MH", "440001"),  # Sitabuldi
+        ]
+
+        # Street names (realistic Indian address format)
+        street_names = [
+            "MG Road", "Station Road", "Civil Lines", "Model Town",
+            "Rajaji Marg", "Jawahar Lane", "Gandhi Nagar", "Nehru Street",
+            "Patel Marg", "Subhash Road", "Indira Colony", "Shastri Nagar",
+        ]
+
+        # Generate a stable random email handle so first + last name + email match
+        first = existing.get("billing_first_name") or random.choice(first_names)
+        last = existing.get("billing_last_name") or random.choice(last_names)
+        city, state, pincode = random.choice(locations)
+        street = random.choice(street_names)
+        house_num = random.randint(1, 999)
+        phone = "9" + "".join(random.choices(string.digits, k=9))  # Indian mobile
+        email_handle = (first + last).lower() + str(random.randint(100, 9999))
+        email = f"{email_handle}@gmail.com"
+
+        # Only fill fields that aren't already in `existing`
+        if "billing_first_name" not in existing:
+            out["billing_first_name"] = first
+        if "billing_last_name" not in existing:
+            out["billing_last_name"] = last
+        if "billing_email" not in existing:
+            out["billing_email"] = email
+        if "billing_phone" not in existing:
+            out["billing_phone"] = phone
+        if "billing_address_1" not in existing:
+            out["billing_address_1"] = f"{house_num}, {street}"
+        if "billing_city" not in existing:
+            out["billing_city"] = city
+        if "billing_state" not in existing:
+            out["billing_state"] = state
+        if "billing_postcode" not in existing:
+            out["billing_postcode"] = pincode
+        if "billing_country" not in existing:
+            out["billing_country"] = "IN"
+
+        logger.info(
+            f"Generated random billing for missing fields: "
+            f"{first} {last}, {city} {state} {pincode}, {email}"
+        )
+        return out
+
+    async def fill_and_submit_checkout(self, billing: dict | None = None, nonce: str = "") -> dict:
+        """
+        Fill billing fields and submit checkout via Playwright.
+
+        billing: dict of billing fields, OR None to auto-detect existing values
+                on the page and fill missing ones with random data.
+        nonce:   checkout nonce from get_checkout_page(). May be empty — we'll
+                try to re-extract it from the page.
+        """
+        await self.on_status("📦 Loading checkout form...")
 
         try:
+            # If we're not already on the checkout page, navigate to it.
+            if "checkout" not in (self.page.url or "").lower():
+                ok = await self._ensure_page_loaded(CHECKOUT_URL)
+                if not ok:
+                    return {"result": "failure", "messages": "Could not load checkout page", "redirect": ""}
+
+            # ----------------------------------------------------------------
+            # STEP 1: Read existing (pre-filled) billing values from the form.
+            # ----------------------------------------------------------------
+            existing_billing = await self._read_existing_billing_fields()
+            logger.info(f"Pre-filled billing fields: {list(existing_billing.keys())}")
+
+            # ----------------------------------------------------------------
+            # STEP 2: Decide which billing dict to use.
+            #   - If caller passed a billing dict → merge with existing
+            #     (caller's values override existing, existing overrides random)
+            #   - If caller passed None → use existing + generate missing
+            # ----------------------------------------------------------------
+            if billing is None:
+                # Auto mode: use existing values, fill gaps with random data
+                needed = self._generate_random_billing(existing_billing)
+                merged = {**needed, **existing_billing}  # existing wins
+                if existing_billing:
+                    await self.on_status(
+                        f"📋 Using pre-filled billing ({len(existing_billing)} fields). "
+                        f"Filling {len(needed)} missing..."
+                    )
+                else:
+                    await self.on_status("📋 Generating billing details automatically...")
+                billing = merged
+            else:
+                # Caller provided values — merge: caller > existing > random
+                needed = self._generate_random_billing({**billing, **existing_billing})
+                billing = {**needed, **existing_billing, **billing}
+
+            logger.info(f"Final billing fields to fill: {list(billing.keys())}")
+
+            # ----------------------------------------------------------------
+            # STEP 3: Fill the form fields.
+            # ----------------------------------------------------------------
+            await self.on_status("📝 Filling billing form...")
+
             # Text input fields — use fill()
             text_field_map = {
                 "billing_first_name": "billing_first_name",
@@ -1186,7 +1361,7 @@ class SiteEngine:
             }
 
             for key, selector_id in text_field_map.items():
-                if key in billing:
+                if key in billing and billing[key]:
                     field = self.page.locator(f"#{selector_id}")
                     if await field.count() > 0:
                         await field.fill(billing[key])

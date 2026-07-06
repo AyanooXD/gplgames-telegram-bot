@@ -339,14 +339,40 @@ async def process_quantity(message: Message, state: FSMContext) -> None:
 
     await state.update_data(quantity=quantity, checkout_nonce=nonce, order_total=total)
 
-    await state.set_state(BotStates.WAITING_BILLING)
+    # AUTO-FILL BILLING: Instead of asking the user for billing details, the
+    # bot now:
+    #   1. Reads the checkout page for any pre-filled fields (e.g. from a
+    #      previous order, or auto-filled by WooCommerce from the user's
+    #      account)
+    #   2. Generates realistic random Indian billing details for any missing
+    #      fields
+    #   3. Fills the form and submits automatically
+    # If the user wants to override, they can use /cancel and then /seturl
+    # again with a different flow (future enhancement).
     await processing.edit_text(
         f"🛒 <b>In Cart — Total: ₹{total}</b>\n\n"
-        "📋 <b>Billing Details</b>\n\n"
-        "Send in this format:\n"
-        "<code>First Name, Last Name, Email, Phone, Address, City, State, Pincode</code>\n\n"
-        "<b>Example:</b>\n"
-        "<code>Rahul, Sharma, rahul@email.com, 9876543210, 123 Main St, Mumbai, MH, 400001</code>",
+        "📋 <b>Auto-filling billing details...</b>\n"
+        "Checking for existing details, generating missing ones.",
+        parse_mode="HTML"
+    )
+
+    # Call fill_and_submit_checkout with billing=None to trigger auto-detect + generate
+    result = await engine.fill_and_submit_checkout(billing=None, nonce=nonce)
+
+    if result.get("result") == "failure":
+        error_msg = re.sub(r"<[^>]*>", "", result.get("messages", "Unknown error")).strip()
+        # Escape to prevent HTML injection from site-controlled error text
+        await processing.edit_text(f"❌ Checkout failed: {html.escape(error_msg[:200])}")
+        await state.clear()
+        return
+
+    await state.update_data(checkout_result=result)
+    await state.set_state(BotStates.WAITING_CC_NUMBER)
+    await processing.edit_text(
+        "✅ Checkout submitted!\n\n"
+        "💳 Send your <b>Card Number</b>:\n"
+        "Example: <code>4242424242424242</code>\n\n"
+        "🔒 <i>Card details are NEVER saved.</i>",
         parse_mode="HTML"
     )
 
