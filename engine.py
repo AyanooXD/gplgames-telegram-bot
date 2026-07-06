@@ -1532,19 +1532,176 @@ class SiteEngine:
 # ================================================================
 # RAZORPAY MODAL HELPERS
 # ================================================================
-async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
-    """Fill RazorPay modal that's already open in the page."""
-    await engine.on_status("💳 RazorPay modal found! Entering card details...")
-    cc = engine._cc
-    filled = False
-
-    for frame in engine.page.frames:
-        if "razorpay" not in (frame.url or "").lower():
+async def _dump_razorpay_frames(engine: SiteEngine) -> None:
+    """Diagnostic: log every frame URL and the input elements inside it.
+    Helps debug 'Could not fill card number' errors when RazorPay changes
+    their iframe structure."""
+    logger.info(f"=== RAZORPAY FRAME DUMP (total frames: {len(engine.page.frames)}) ===")
+    for i, frame in enumerate(engine.page.frames):
+        url = frame.url or "(no url)"
+        logger.info(f"  Frame[{i}] URL: {url}")
+        if "razorpay" not in url.lower():
             continue
         try:
-            await asyncio.sleep(2)
+            inputs = await frame.evaluate(
+                """() => {
+                    const out = [];
+                    for (const el of document.querySelectorAll('input, button, [role="textbox"], iframe')) {
+                        out.push({
+                            tag: el.tagName.toLowerCase(),
+                            type: el.type || '',
+                            name: el.name || '',
+                            id: el.id || '',
+                            placeholder: el.placeholder || '',
+                            value: el.value ? '(has value)' : '',
+                            visible: el.offsetParent !== null,
+                            ariaLabel: el.getAttribute('aria-label') || '',
+                            autocomplete: el.autocomplete || '',
+                        });
+                    }
+                    return out;
+                }"""
+            )
+            for inp in inputs:
+                logger.info(f"    {inp}")
+        except Exception as e:
+            logger.info(f"    (could not read frame: {e})")
 
-            # Click "Card" tab if visible
+
+async def _find_card_input_in_frame(frame, field_type: str = "number") -> any:
+    """
+    Find a card input element in a RazorPay frame using multiple strategies.
+
+    Modern RazorPay uses separate iframes per field (card_number, card_expiry,
+    card_cvv). Each iframe has a single <input> with no name/id, or with
+    field-specific attributes.
+
+    field_type: 'number', 'expiry', or 'cvv'
+    """
+    # Strategy 1: Traditional named inputs (old RazorPay UI)
+    name_patterns = {
+        "number":  ["card[number]", "card_number", "cardNumber", "cc-number"],
+        "expiry":  ["card[expiry]", "card_expiry", "cardExpiry", "cc-exp"],
+        "cvv":     ["card[cvv]", "card_cvv", "cardCvv", "cc-csc", "cc-cvv"],
+    }
+    for name in name_patterns.get(field_type, []):
+        try:
+            loc = frame.locator(f'input[name="{name}"]')
+            if await loc.count() > 0:
+                return loc.first
+        except Exception:
+            pass
+
+    # Strategy 2: ID-based selectors
+    id_patterns = {
+        "number":  ["card-number", "card_number", "cardNumber", "cc-number"],
+        "expiry":  ["card-expiry", "card_expiry", "cardExpiry", "cc-exp"],
+        "cvv":     ["card-cvv", "card_cvv", "cardCvv", "cc-cvv", "cvv"],
+    }
+    for id_val in id_patterns.get(field_type, []):
+        try:
+            loc = frame.locator(f'#{id_val}')
+            if await loc.count() > 0:
+                return loc.first
+        except Exception:
+            pass
+
+    # Strategy 3: Autocomplete attribute (modern RazorPay uses this)
+    autocomplete_patterns = {
+        "number":  ["cc-number", "cc-csc"],  # cc-csc is CVV, filter below
+        "expiry":  ["cc-exp"],
+        "cvv":     ["cc-csc", "cc-cvv"],
+    }
+    for ac in autocomplete_patterns.get(field_type, []):
+        try:
+            loc = frame.locator(f'input[autocomplete="{ac}"]')
+            if await loc.count() > 0:
+                return loc.first
+        except Exception:
+            pass
+
+    # Strategy 4: aria-label based
+    aria_patterns = {
+        "number":  ["card number", "card_number", "Card Number"],
+        "expiry":  ["expiry", "mm/yy", "MM/YY", "Expiry"],
+        "cvv":     ["cvv", "cvc", "CVV", "CVC"],
+    }
+    for aria in aria_patterns.get(field_type, []):
+        try:
+            loc = frame.locator(f'[aria-label*="{aria}" i]')
+            if await loc.count() > 0:
+                return loc.first
+        except Exception:
+            pass
+
+    # Strategy 5: If the frame URL contains the field type, grab the first
+    # visible input (modern RazorPay: one iframe per field, URL contains hint)
+    try:
+        url = (frame.url or "").lower()
+        url_hints = {
+            "number":  ["card_number", "card-number", "number"],
+            "expiry":  ["card_expiry", "card-expiry", "expiry", "exp"],
+            "cvv":     ["card_cvv", "card-cvv", "cvv", "csc", "security"],
+        }
+        hints = url_hints.get(field_type, [])
+        if any(h in url for h in hints):
+            loc = frame.locator('input, [role="textbox"]')
+            count = await loc.count()
+            for j in range(count):
+                try:
+                    el = loc.nth(j)
+                    if await el.is_visible(timeout=1000):
+                        return el
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # Strategy 6: Placeholder-based
+    placeholder_patterns = {
+        "number":  ["card number", "0000 0000", "1234 5678", "•"],
+        "expiry":  ["mm/yy", "MM/YY", "expiry", "MMYY"],
+        "cvv":     ["cvv", "cvc", "123"],
+    }
+    for ph in placeholder_patterns.get(field_type, []):
+        try:
+            loc = frame.locator(f'input[placeholder*="{ph}" i]')
+            if await loc.count() > 0:
+                return loc.first
+        except Exception:
+            pass
+
+    return None
+
+
+async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
+    """Fill RazorPay modal that's already open in the page.
+
+    Handles both old (single iframe with all fields) and new (separate
+    iframes per card field) RazorPay UI layouts.
+    """
+    await engine.on_status("💳 RazorPay modal found! Entering card details...")
+    cc = engine._cc
+
+    # Wait for modal to fully load — RazorPay loads iframes asynchronously
+    await asyncio.sleep(3)
+
+    # Diagnostic dump
+    await _dump_razorpay_frames(engine)
+
+    filled_card = False
+    filled_exp = False
+    filled_cvv = False
+
+    # First, try the OLD layout: single iframe with all card fields
+    razorpay_frames = [f for f in engine.page.frames if "razorpay" in (f.url or "").lower()]
+    logger.info(f"Found {len(razorpay_frames)} RazorPay frame(s)")
+
+    for frame in razorpay_frames:
+        if filled_card and filled_exp and filled_cvv:
+            break
+        try:
+            # Click "Card" tab if visible (some RazorPay UIs show payment method tabs)
             try:
                 card_tab = frame.locator('text="Card"')
                 if await card_tab.count() > 0:
@@ -1553,80 +1710,131 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
             except Exception:
                 pass
 
-            # Card number — use type() for custom inputs that ignore fill()
-            card_input = frame.locator('input[name="card[number]"]')
-            card_filled_ok = False
-            if await card_input.count() > 0:
-                try:
-                    if await card_input.is_visible(timeout=5000):
-                        await card_input.click()
+            # Try to fill card number
+            if not filled_card:
+                card_input = await _find_card_input_in_frame(frame, "number")
+                if card_input is not None:
+                    try:
+                        await card_input.click(timeout=3000)
                         await asyncio.sleep(0.3)
                         await card_input.fill("")
                         await card_input.type(cc.number, delay=30)
                         await asyncio.sleep(0.5)
-                        card_filled_ok = True
-                except Exception as e:
-                    logger.error(f"Card number fill error: {e}")
+                        filled_card = True
+                        logger.info(f"Card number filled in frame: {frame.url}")
+                    except Exception as e:
+                        logger.warning(f"Card number fill attempt failed: {e}")
 
-            if not card_filled_ok:
-                # Card number is mandatory — skip frame if it couldn't be filled
-                logger.error("Could not fill card number in this frame")
-                continue
-
-            # Expiry
-            exp_input = frame.locator('input[name="card[expiry]"]')
-            if await exp_input.count() > 0:
-                try:
-                    if await exp_input.is_visible(timeout=3000):
-                        await exp_input.click()
+            # Try to fill expiry
+            if not filled_exp:
+                exp_input = await _find_card_input_in_frame(frame, "expiry")
+                if exp_input is not None:
+                    try:
+                        await exp_input.click(timeout=3000)
                         await asyncio.sleep(0.3)
                         await exp_input.fill("")
-                        await exp_input.type(cc.expiry, delay=30)
+                        # RazorPay expects MM/YY format
+                        exp_val = cc.expiry if "/" in cc.expiry else f"{cc.expiry[:2]}/{cc.expiry[2:]}"
+                        await exp_input.type(exp_val, delay=30)
                         await asyncio.sleep(0.5)
-                except Exception as e:
-                    logger.error(f"Expiry fill error: {e}")
+                        filled_exp = True
+                        logger.info(f"Expiry filled in frame: {frame.url}")
+                    except Exception as e:
+                        logger.warning(f"Expiry fill attempt failed: {e}")
 
-            # CVV
-            cvv_input = frame.locator('input[name="card[cvv]"]')
-            if await cvv_input.count() > 0:
-                try:
-                    if await cvv_input.is_visible(timeout=3000):
-                        await cvv_input.click()
+            # Try to fill CVV
+            if not filled_cvv:
+                cvv_input = await _find_card_input_in_frame(frame, "cvv")
+                if cvv_input is not None:
+                    try:
+                        await cvv_input.click(timeout=3000)
                         await asyncio.sleep(0.3)
                         await cvv_input.fill("")
                         await cvv_input.type(cc.cvv, delay=30)
                         await asyncio.sleep(0.5)
-                except Exception as e:
-                    logger.error(f"CVV fill error: {e}")
+                        filled_cvv = True
+                        logger.info(f"CVV filled in frame: {frame.url}")
+                    except Exception as e:
+                        logger.warning(f"CVV fill attempt failed: {e}")
 
-            filled = True
-            await engine.on_status("⏳ Submitting payment to RazorPay...")
-
-            # Click pay button — try multiple selectors in order
-            pay_clicked = False
-            for selector in [
-                'button[class*="pay"]',
-                'button#pay-button',
-                'button:has-text("Pay")',
-                'input[type="submit"][value*="Pay"]',
-            ]:
-                try:
-                    pay_btn = frame.locator(selector)
-                    if await pay_btn.count() > 0 and await pay_btn.first.is_visible(timeout=2000):
-                        await pay_btn.first.click()
-                        pay_clicked = True
-                        break
-                except Exception:
-                    continue
-            if not pay_clicked:
-                logger.error("Could not find/click RazorPay pay button")
-            break
         except Exception as e:
-            logger.error(f"Error filling RazorPay frame: {e}")
+            logger.error(f"Error processing RazorPay frame {frame.url}: {e}")
             continue
 
-    if not filled:
-        return {"status": "error", "message": "Could not fill card details in RazorPay modal."}
+    logger.info(f"Fill status: card={filled_card}, expiry={filled_exp}, cvv={filled_cvv}")
+
+    if not filled_card:
+        # Card number is mandatory — can't proceed without it
+        return {
+            "status": "error",
+            "message": (
+                "Could not find the card number field in RazorPay. "
+                "RazorPay may have updated their UI. "
+                "Please check /logs/live_issues.log for the frame dump."
+            ),
+        }
+
+    if not filled_exp or not filled_cvv:
+        logger.warning(f"Missing: expiry={not filled_exp}, cvv={not filled_cvv}")
+        # Try one more time with a longer wait — iframes may still be loading
+        await asyncio.sleep(2)
+        for frame in razorpay_frames:
+            if not filled_exp:
+                exp_input = await _find_card_input_in_frame(frame, "expiry")
+                if exp_input is not None:
+                    try:
+                        await exp_input.click(timeout=3000)
+                        await exp_input.fill("")
+                        exp_val = cc.expiry if "/" in cc.expiry else f"{cc.expiry[:2]}/{cc.expiry[2:]}"
+                        await exp_input.type(exp_val, delay=30)
+                        filled_exp = True
+                        logger.info(f"Expiry filled on retry in frame: {frame.url}")
+                    except Exception:
+                        pass
+            if not filled_cvv:
+                cvv_input = await _find_card_input_in_frame(frame, "cvv")
+                if cvv_input is not None:
+                    try:
+                        await cvv_input.click(timeout=3000)
+                        await cvv_input.fill("")
+                        await cvv_input.type(cc.cvv, delay=30)
+                        filled_cvv = True
+                        logger.info(f"CVV filled on retry in frame: {frame.url}")
+                    except Exception:
+                        pass
+
+    await engine.on_status("⏳ Submitting payment to RazorPay...")
+
+    # Click pay button — search ALL frames, not just the ones we filled
+    pay_clicked = False
+    for frame in engine.page.frames:
+        if "razorpay" not in (frame.url or "").lower():
+            continue
+        for selector in [
+            'button[class*="pay"]',
+            'button#pay-button',
+            'button:has-text("Pay")',
+            'button:has-text("pay")',
+            'input[type="submit"][value*="Pay"]',
+            'button[type="submit"]',
+            '#checkout-pay',
+            'button.btn-primary',
+        ]:
+            try:
+                pay_btn = frame.locator(selector)
+                if await pay_btn.count() > 0:
+                    if await pay_btn.first.is_visible(timeout=2000):
+                        await pay_btn.first.click()
+                        pay_clicked = True
+                        logger.info(f"Pay button clicked in frame {frame.url} with selector {selector}")
+                        break
+            except Exception:
+                continue
+        if pay_clicked:
+            break
+
+    if not pay_clicked:
+        logger.error("Could not find/click RazorPay pay button in any frame")
 
     await asyncio.sleep(8)
     try:
