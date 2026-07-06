@@ -709,11 +709,102 @@ class SiteEngine:
                 pass
             await asyncio.sleep(2)
 
+            # CRITICAL: gplgames.net sometimes throws a SECONDARY bot verification
+            # challenge when the login form is submitted (different from the
+            # initial visit captcha). Detect it and solve it before checking
+            # login status. May need to solve + resubmit up to 2 times.
+            max_login_attempts = 3
+            for attempt in range(max_login_attempts):
+                post_url = self.page.url
+                post_content = await self._safe_get_content()
+
+                # Already logged in? Done.
+                if self._is_logged_in(post_content, post_url):
+                    logger.info(f"Logged in after attempt {attempt + 1}")
+                    break
+
+                # Not logged in and no captcha visible? Either login failed
+                # with an error message, or the form is still showing.
+                if "Bot Verification" not in post_content:
+                    logger.info(
+                        f"Attempt {attempt + 1}: no captcha, not logged in "
+                        f"(URL={post_url}, title detected separately)"
+                    )
+                    break
+
+                # Captcha present — solve it.
+                logger.warning(
+                    f"Secondary captcha triggered after login submit "
+                    f"(attempt {attempt + 1}/{max_login_attempts}, URL={post_url}). Solving..."
+                )
+                await self.on_status(
+                    f"🤖 Login triggered another captcha — solving (attempt {attempt + 1})..."
+                )
+
+                captcha_passed = await self._solve_captcha_and_navigate(self.page, LOGIN_URL)
+                if not captcha_passed:
+                    logger.error(f"Secondary captcha (attempt {attempt + 1}) failed")
+                    await self.on_status(
+                        "❌ Login captcha failed.\n"
+                        "💡 Try /cookies for free login (no captcha)."
+                    )
+                    return False
+
+                # After captcha, re-navigate to login URL to check status
+                try:
+                    await self.page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    logger.error(f"Post-captcha navigation to login URL failed: {e}")
+                    await self.on_status("❌ Could not reach my-account after captcha.")
+                    return False
+
+                # Check if we're now on the login FORM (meaning we need to
+                # re-submit credentials) or already logged in.
+                content_after_captcha = await self._safe_get_content()
+                if self._is_logged_in(content_after_captcha, self.page.url):
+                    logger.info(f"Logged in after captcha (attempt {attempt + 1})")
+                    break
+
+                # If login form is showing again, the captcha cleared but we
+                # need to re-fill and re-submit credentials (gplgames does
+                # this: captcha resets the session, then you re-login).
+                if "woocommerce-login-nonce" in content_after_captcha:
+                    logger.info(f"Re-submitting credentials after captcha (attempt {attempt + 1})")
+                    await self.on_status("🔄 Re-submitting credentials after captcha...")
+
+                    email_input = self.page.locator('input#username')
+                    if await email_input.count() > 0:
+                        await email_input.fill(email)
+                    pass_input = self.page.locator('input#password')
+                    if await pass_input.count() > 0:
+                        await pass_input.fill(password)
+                    await asyncio.sleep(0.5)
+
+                    login_btn = self.page.locator('button[name="login"]')
+                    if await login_btn.count() > 0:
+                        await login_btn.click()
+                        logger.info("Re-clicked login button after captcha")
+
+                    try:
+                        await self.page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2)
+                    # Loop continues to next attempt — will check status again
+                else:
+                    # Neither logged in nor login form — unusual state, give up
+                    logger.error(
+                        f"After captcha (attempt {attempt + 1}): unexpected page state. "
+                        f"URL={self.page.url}"
+                    )
+                    break
+
+            # Final status check after all attempts
             post_url = self.page.url
-            logger.info(f"Post-login URL: {post_url}")
             content = await self._safe_get_content()
             is_logged = self._is_logged_in(content, post_url)
-            logger.info(f"Logged-in check after submit: {is_logged}")
+            logger.info(f"Logged-in check after submit: {is_logged} (URL={post_url})")
 
             if is_logged:
                 await self.on_status("✅ Login successful! Session is persistent.")
