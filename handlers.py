@@ -10,6 +10,7 @@ Login methods:
 """
 
 import re
+import html
 from aiogram import Router, F
 from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
@@ -291,8 +292,8 @@ async def process_quantity(message: Message, state: FSMContext) -> None:
         return
 
     text = (message.text or "").strip()
-    if not text.isdigit() or int(text) < 1:
-        await message.answer("⚠️ Send a valid number (1, 2, 3...):")
+    if not text.isdigit() or int(text) < 1 or int(text) > 999:
+        await message.answer("⚠️ Send a valid number between 1 and 999:")
         return
 
     quantity = int(text)
@@ -389,7 +390,8 @@ async def process_billing(message: Message, state: FSMContext) -> None:
 
     if result.get("result") == "failure":
         error_msg = re.sub(r"<[^>]*>", "", result.get("messages", "Unknown error")).strip()
-        await processing.edit_text(f"❌ Checkout failed: {error_msg[:200]}")
+        # Escape to prevent HTML injection from site-controlled error text
+        await processing.edit_text(f"❌ Checkout failed: {html.escape(error_msg[:200])}")
         await state.clear()
         return
 
@@ -414,13 +416,20 @@ async def process_cc_number(message: Message, state: FSMContext) -> None:
         return
 
     cc_number = (message.text or "").replace(" ", "").replace("-", "")
-    if not cc_number.isdigit() or len(cc_number) < 13:
+    if not cc_number.isdigit() or len(cc_number) < 13 or len(cc_number) > 19:
         await message.answer("⚠️ Invalid card number (13-19 digits):")
         return
+
+    # Delete the user's message so the card number doesn't linger in chat history
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
     await state.update_data(cc_number=cc_number)
     await state.set_state(BotStates.WAITING_CC_EXPIRY)
     await message.answer(
+        "✅ Card number received (deleted for privacy).\n\n"
         "📅 Send card <b>Expiry</b> as <code>MM/YY</code> (e.g., <code>12/28</code>):",
         parse_mode="HTML"
     )
@@ -446,9 +455,16 @@ async def process_cc_expiry(message: Message, state: FSMContext) -> None:
         await message.answer("⚠️ Invalid month (01-12):")
         return
 
+    # Delete the user's message so expiry doesn't linger in chat history
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
     await state.update_data(cc_expiry=f"{expiry_clean[:2]}/{expiry_clean[2:]}")
     await state.set_state(BotStates.WAITING_CVV)
     await message.answer(
+        "✅ Expiry received (deleted for privacy).\n\n"
         "🔒 Send your card <b>CVV</b> (3 or 4 digits):",
         parse_mode="HTML"
     )
@@ -467,6 +483,12 @@ async def process_cvv(message: Message, state: FSMContext) -> None:
     if not cvv.isdigit() or len(cvv) < 3 or len(cvv) > 4:
         await message.answer("⚠️ Invalid CVV (3-4 digits):")
         return
+
+    # Delete the user's CVV message immediately for privacy
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
     data = await state.get_data()
     cc_number = data.get("cc_number", "")
@@ -496,20 +518,20 @@ async def process_cvv(message: Message, state: FSMContext) -> None:
     msg = result.get("message", "Unknown result")
 
     if status == "success":
-        response_text = f"✅ <b>Payment Completed!</b>\n\n💬 {msg}"
+        response_text = f"✅ <b>Payment Completed!</b>\n\n💬 {html.escape(msg)}"
         url = result.get("url", "")
         if url:
-            response_text += f"\n\n🔗 <code>{url}</code>"
+            response_text += f"\n\n🔗 <code>{html.escape(url)}</code>"
     elif status == "needs_review":
         response_text = (
             f"⚠️ <b>Payment Submitted — Verify</b>\n\n"
-            f"💬 {msg}\n\n"
+            f"💬 {html.escape(msg)}\n\n"
             f"Check your email/WhatsApp for order confirmation."
         )
     else:
         response_text = (
             f"❌ <b>Payment Issue</b>\n\n"
-            f"💬 {msg}\n\n"
+            f"💬 {html.escape(msg)}\n\n"
             "Possible reasons:\n"
             "• Invalid card details\n"
             "• Card declined\n"
@@ -603,3 +625,39 @@ async def cmd_help(message: Message) -> None:
         "🛡️ Captcha: Nopecha (auto-solved)",
         parse_mode="HTML"
     )
+
+
+# ============================================================
+# FALLBACK — catch non-text / unrecognized messages
+# ============================================================
+@router.message()
+async def fallback(message: Message, state: FSMContext) -> None:
+    """Catch-all for messages that don't match any command or expected state input.
+
+    - If a state is active, remind the user what's expected.
+    - Otherwise nudge them to /start.
+    """
+    current_state = await state.get_state()
+    if current_state is not None:
+        hints = {
+            BotStates.WAITING_EMAIL:        "your <b>email/username</b>",
+            BotStates.WAITING_PASSWORD:     "your <b>password</b>",
+            BotStates.WAITING_COOKIES:      "the <b>cookie string</b> from your browser",
+            BotStates.WAITING_URL:          "the <b>product URL</b> from gplgames.net",
+            BotStates.WAITING_QUANTITY:     "a <b>quantity</b> (e.g., 1)",
+            BotStates.WAITING_BILLING:      "<b>billing details</b> (comma-separated, 8 fields)",
+            BotStates.WAITING_CC_NUMBER:    "your <b>card number</b> (13-19 digits)",
+            BotStates.WAITING_CC_EXPIRY:    "your <b>card expiry</b> as MM/YY",
+            BotStates.WAITING_CVV:          "your <b>CVV</b> (3-4 digits)",
+        }
+        hint = hints.get(current_state, "the expected input")
+        await message.answer(
+            f"⚠️ I'm waiting for {hint}.\n"
+            f"Send <code>/cancel</code> to abort.",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            "🤖 Unknown command. Send <code>/start</code> to see available commands.",
+            parse_mode="HTML"
+        )

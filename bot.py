@@ -32,7 +32,7 @@ logging.root.addFilter(SecureLogFilter())
 
 async def main() -> None:
     """Start the Telegram bot."""
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("=" * 50)
         print("ERROR: Bot token not set!")
         print("=" * 50)
@@ -43,7 +43,9 @@ async def main() -> None:
         print("  3. Choose a name for your bot")
         print("  4. Choose a username (must end in 'bot')")
         print("  5. Copy the token BotFather gives you")
-        print("  6. Paste it in config.py -> BOT_TOKEN")
+        print("  6. Set it as an env var:")
+        print('       export BOT_TOKEN="your-token-here"')
+        print("     Or paste it in config.py -> BOT_TOKEN")
         print()
         print("Then run this script again.")
         sys.exit(1)

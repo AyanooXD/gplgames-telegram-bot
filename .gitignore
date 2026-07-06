@@ -10,6 +10,8 @@ venv/
 # Sessions & sensitive data
 sessions/
 *.log
+.env
+.env.local
 
 # IDE
 .vscode/

@@ -20,18 +20,15 @@ class SecureLogFilter(logging.Filter):
     ]
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # getMessage() returns `msg % args` if args are present. We need to
+        # redact BOTH the format string and the args, then clear args so the
+        # handler doesn't try to format again (which would fail because the
+        # redacted msg has no %s placeholders left).
         msg = str(record.getMessage())
         for pattern, replacement in self.SENSITIVE_PATTERNS:
             msg = pattern.sub(replacement, msg)
         record.msg = msg
-        # Also clean args
-        if record.args:
-            record.args = tuple(
-                "[REDACTED]" if isinstance(a, str) and any(
-                    p.search(a) for p, _ in self.SENSITIVE_PATTERNS
-                ) else a
-                for a in record.args
-            )
+        record.args = None  # critical: prevent double-formatting crash
         return True
 
 

@@ -117,8 +117,26 @@ class SiteEngine:
         self.page = await self.context.new_page()
         self.page.set_default_timeout(BROWSER_TIMEOUT)
 
+        # Restore localStorage after the page exists. We must navigate to the
+        # site first because localStorage is origin-scoped.
+        saved_storage = self.session_manager.load_local_storage()
+        if saved_storage:
+            try:
+                await self.page.goto(SITE_URL, wait_until="domcontentloaded", timeout=15000)
+                await self.page.evaluate(
+                    """(entries) => {
+                        for (const {key, value} of entries) {
+                            try { window.localStorage.setItem(key, value); } catch (e) {}
+                        }
+                    }""",
+                    saved_storage,
+                )
+                logger.info(f"Restored {len(saved_storage)} localStorage entries")
+            except Exception as e:
+                logger.warning(f"Could not restore localStorage: {e}")
+
     async def close(self) -> None:
-        """Save cookies and close browser."""
+        """Save cookies and localStorage, then close browser."""
         # 1. Save cookies first (separate try so browser close still happens)
         try:
             if self.context:
@@ -133,6 +151,31 @@ class SiteEngine:
                     logger.info("Session cookies saved")
         except Exception as e:
             logger.error(f"Error saving cookies on close: {e}")
+
+        # 1b. Save localStorage (origin-scoped, requires being on the site)
+        try:
+            if self.page:
+                # Make sure we're on the site origin before reading storage
+                if "gplgames.net" not in (self.page.url or ""):
+                    try:
+                        await self.page.goto(SITE_URL, wait_until="domcontentloaded", timeout=15000)
+                    except Exception:
+                        pass
+                storage_entries = await self.page.evaluate(
+                    """() => {
+                        const out = [];
+                        for (let i = 0; i < window.localStorage.length; i++) {
+                            const k = window.localStorage.key(i);
+                            try { out.push({key: k, value: window.localStorage.getItem(k)}); } catch (e) {}
+                        }
+                        return out;
+                    }"""
+                )
+                if storage_entries:
+                    self.session_manager.save_local_storage(storage_entries)
+                    logger.info(f"Saved {len(storage_entries)} localStorage entries")
+        except Exception as e:
+            logger.error(f"Error saving localStorage on close: {e}")
 
         # 2. Wipe CC
         if self._cc:
@@ -446,6 +489,21 @@ class SiteEngine:
             await self.on_status("❌ Verification failed after all attempts.\n\n💡 Use /cookies for free login (no captcha needed).")
             return False
 
+        # Save cookies immediately so subsequent loads skip captcha entirely.
+        try:
+            if self.context:
+                cookies = await self.context.cookies()
+                cookie_list = [
+                    {"name": c["name"], "value": c["value"],
+                     "domain": c.get("domain", ""), "path": c.get("path", "/")}
+                    for c in cookies
+                ]
+                if cookie_list:
+                    self.session_manager.save_cookies(cookie_list)
+                    logger.info("Post-captcha cookies saved")
+        except Exception as e:
+            logger.error(f"Error saving post-captcha cookies: {e}")
+
         return True
 
     async def _ensure_page_loaded(self, url: str) -> bool:
@@ -585,28 +643,68 @@ class SiteEngine:
                 await self.on_status("❌ URL must be from gplgames.net")
                 return False
 
+            # Block obvious non-product URLs early (homepage, shop, cart, etc.)
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(url)
+            path = (parsed.path or "").rstrip("/")
+            qs = parse_qs(parsed.query)
+
+            # If ?p=N is present, it's a product ID link — trust it after validation
             pid_match = re.search(r"[?&]p=(\d+)", url)
             if pid_match:
-                # Validate by briefly loading the page
                 product_id = int(pid_match.group(1))
                 product_url = f"{SITE_URL}/?post_type=product&p={product_id}"
                 ok = await self._ensure_page_loaded(product_url)
                 if not ok:
                     return False
                 content = await self.page.content()
-                if "add_to_cart" not in content and "add-to-cart" not in content:
+
+                # Require BOTH a "post_type=product" hint AND an add-to-cart
+                # control to avoid false positives from category/shop pages.
+                has_add_to_cart = (
+                    "add_to_cart" in content
+                    or "add-to-cart" in content
+                    or 'name="add-to-cart"' in content
+                )
+                has_product_marker = (
+                    "single-product" in content
+                    or "woocommerce-product" in content
+                    or 'class="product ' in content
+                    or "product_id" in content
+                )
+                if not (has_add_to_cart and has_product_marker):
                     await self.on_status("❌ URL has product ID but page is not a valid product.")
                     return False
                 self.product_id = product_id
                 await self.on_status(f"✅ Valid product! (ID: {self.product_id})")
                 return True
 
+            # Non-?p= URL — load and inspect
             ok = await self._ensure_page_loaded(url)
             if not ok:
                 return False
 
             content = await self.page.content()
-            if "add_to_cart" not in content and "add-to-cart" not in content:
+
+            # Reject obvious non-product paths up front
+            non_product_paths = ("/shop", "/cart", "/checkout", "/my-account", "/product-category")
+            if any(path == np or path.startswith(np) for np in non_product_paths):
+                if "post_type=product" not in (parsed.query or ""):
+                    await self.on_status("❌ Not a product page (looks like a listing/account page).")
+                    return False
+
+            # Require both an add-to-cart control and a product marker
+            has_add_to_cart = (
+                "add_to_cart" in content
+                or "add-to-cart" in content
+                or 'name="add-to-cart"' in content
+            )
+            has_product_marker = (
+                "single-product" in content
+                or "woocommerce-product" in content
+                or 'class="product ' in content
+            )
+            if not (has_add_to_cart and has_product_marker):
                 await self.on_status("❌ Not a valid product page.")
                 return False
 
@@ -647,13 +745,32 @@ class SiteEngine:
                 await qty_input.fill(str(quantity))
                 await asyncio.sleep(0.3)
 
-            add_btn = self.page.locator('button.single_add_to_cart_button[name="add-to-cart"]')
-            if await add_btn.count() > 0:
+            # Try multiple selectors — WooCommerce themes use <button> OR <a>
+            # with class single_add_to_cart_button, sometimes with different
+            # name attributes.
+            add_btn = None
+            for selector in [
+                'button.single_add_to_cart_button[name="add-to-cart"]',
+                'button.single_add_to_cart_button',
+                'a.single_add_to_cart_button',
+                'button[name="add-to-cart"]',
+                'input[name="add-to-cart"]',
+            ]:
+                candidate = self.page.locator(selector).first
+                try:
+                    if await candidate.count() > 0 and await candidate.is_visible(timeout=2000):
+                        add_btn = candidate
+                        break
+                except Exception:
+                    continue
+
+            if add_btn is not None:
                 await add_btn.click()
                 await asyncio.sleep(3)
 
                 content = await self.page.content()
-                if "has been added to your cart" in content.lower() or "added to cart" in content.lower():
+                lowered = content.lower()
+                if "has been added to your cart" in lowered or "added to cart" in lowered:
                     await self.on_status("✅ Product added to cart!")
                     return True
 
@@ -723,31 +840,67 @@ class SiteEngine:
         await self.on_status("📦 Filling billing details...")
 
         try:
-            field_map = {
+            # Text input fields — use fill()
+            text_field_map = {
                 "billing_first_name": "billing_first_name",
                 "billing_last_name": "billing_last_name",
                 "billing_email": "billing_email",
                 "billing_phone": "billing_phone",
                 "billing_address_1": "billing_address_1",
                 "billing_city": "billing_city",
-                "billing_state": "billing_state",
                 "billing_postcode": "billing_postcode",
             }
 
-            for key, selector_id in field_map.items():
+            for key, selector_id in text_field_map.items():
                 if key in billing:
                     field = self.page.locator(f"#{selector_id}")
                     if await field.count() > 0:
                         await field.fill(billing[key])
                         await asyncio.sleep(0.2)
 
-            # Select country
+            # billing_state is usually a <select> for IN/US/etc, but a text
+            # input for countries without a predefined state list. Try both.
+            state_value = billing.get("billing_state", "")
+            if state_value:
+                state_select = self.page.locator("#billing_state")
+                if await state_select.count() > 0:
+                    tag = await state_select.evaluate("el => el.tagName.toLowerCase()")
+                    if tag == "select":
+                        # Try exact value match first, then label-based match
+                        try:
+                            await state_select.select_option(value=state_value)
+                        except Exception:
+                            try:
+                                await state_select.select_option(label=state_value)
+                            except Exception:
+                                # Last resort: try matching by first 2 chars (state code)
+                                try:
+                                    await state_select.select_option(value=state_value.upper()[:2])
+                                except Exception as e:
+                                    logger.warning(f"Could not select state '{state_value}': {e}")
+                    else:
+                        # It's an input — use fill
+                        try:
+                            await state_select.fill(state_value)
+                        except Exception as e:
+                            logger.warning(f"Could not fill state input: {e}")
+
+            # Select country — default to IN if not provided (gplgames is India-focused)
+            country = billing.get("billing_country", "IN")
             country_select = self.page.locator("#billing_country")
             if await country_select.count() > 0:
                 try:
-                    await country_select.select_option("IN")
-                except Exception:
-                    pass
+                    await country_select.select_option(country)
+                    await asyncio.sleep(0.5)  # State dropdown may reload on country change
+                except Exception as e:
+                    logger.warning(f"Could not select country '{country}': {e}")
+                    # If country select failed, try IN as a fallback
+                    if country != "IN":
+                        try:
+                            await country_select.select_option("IN")
+                            await asyncio.sleep(0.5)
+                        except Exception:
+                            pass
 
             # Ensure RazorPay is selected
             rp_radio = self.page.locator('input#payment_method_razorpay[value="razorpay"]')
@@ -893,45 +1046,78 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
 
             # Card number — use type() for custom inputs that ignore fill()
             card_input = frame.locator('input[name="card[number]"]')
-            if await card_input.count() > 0 and await card_input.is_visible(timeout=5000):
-                await card_input.click()
-                await asyncio.sleep(0.3)
-                await card_input.fill("")
-                await card_input.type(cc.number, delay=30)
-                await asyncio.sleep(0.5)
+            card_filled_ok = False
+            if await card_input.count() > 0:
+                try:
+                    if await card_input.is_visible(timeout=5000):
+                        await card_input.click()
+                        await asyncio.sleep(0.3)
+                        await card_input.fill("")
+                        await card_input.type(cc.number, delay=30)
+                        await asyncio.sleep(0.5)
+                        card_filled_ok = True
+                except Exception as e:
+                    logger.error(f"Card number fill error: {e}")
+
+            if not card_filled_ok:
+                # Card number is mandatory — skip frame if it couldn't be filled
+                logger.error("Could not fill card number in this frame")
+                continue
 
             # Expiry
             exp_input = frame.locator('input[name="card[expiry]"]')
-            if await exp_input.count() > 0 and await exp_input.is_visible(timeout=3000):
-                await exp_input.click()
-                await asyncio.sleep(0.3)
-                await exp_input.fill("")
-                await exp_input.type(cc.expiry, delay=30)
-                await asyncio.sleep(0.5)
+            if await exp_input.count() > 0:
+                try:
+                    if await exp_input.is_visible(timeout=3000):
+                        await exp_input.click()
+                        await asyncio.sleep(0.3)
+                        await exp_input.fill("")
+                        await exp_input.type(cc.expiry, delay=30)
+                        await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"Expiry fill error: {e}")
 
             # CVV
             cvv_input = frame.locator('input[name="card[cvv]"]')
-            if await cvv_input.count() > 0 and await cvv_input.is_visible(timeout=3000):
-                await cvv_input.click()
-                await asyncio.sleep(0.3)
-                await cvv_input.fill("")
-                await cvv_input.type(cc.cvv, delay=30)
-                await asyncio.sleep(0.5)
+            if await cvv_input.count() > 0:
+                try:
+                    if await cvv_input.is_visible(timeout=3000):
+                        await cvv_input.click()
+                        await asyncio.sleep(0.3)
+                        await cvv_input.fill("")
+                        await cvv_input.type(cc.cvv, delay=30)
+                        await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"CVV fill error: {e}")
 
             filled = True
             await engine.on_status("⏳ Submitting payment to RazorPay...")
 
-            # Click pay button
-            pay_btn = frame.locator('button[class*="pay"]')
-            if await pay_btn.count() > 0 and await pay_btn.is_visible(timeout=3000):
-                await pay_btn.click()
+            # Click pay button — try multiple selectors in order
+            pay_clicked = False
+            for selector in [
+                'button[class*="pay"]',
+                'button#pay-button',
+                'button:has-text("Pay")',
+                'input[type="submit"][value*="Pay"]',
+            ]:
+                try:
+                    pay_btn = frame.locator(selector)
+                    if await pay_btn.count() > 0 and await pay_btn.first.is_visible(timeout=2000):
+                        await pay_btn.first.click()
+                        pay_clicked = True
+                        break
+                except Exception:
+                    continue
+            if not pay_clicked:
+                logger.error("Could not find/click RazorPay pay button")
             break
         except Exception as e:
             logger.error(f"Error filling RazorPay frame: {e}")
             continue
 
     if not filled:
-        return {"status": "error", "message": "Could not fill card details in RazorPay."}
+        return {"status": "error", "message": "Could not fill card details in RazorPay modal."}
 
     await asyncio.sleep(8)
     try:
