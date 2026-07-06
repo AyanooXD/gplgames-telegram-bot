@@ -10,6 +10,7 @@ venv/
 # Sessions & sensitive data
 sessions/
 *.log
+logs/
 .env
 .env.local
 
