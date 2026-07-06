@@ -214,6 +214,17 @@ async def process_password(message: Message, state: FSMContext) -> None:
         success = await engine.login(email, password)
 
         if not success:
+            # Clear stale cookies so they don't interfere with the next attempt.
+            # Failed login often leaves half-baked cookies (e.g. captcha-passed
+            # but not logged-in) that cause the next /login to skip captcha
+            # but fail at the actual credential step.
+            try:
+                from session_manager import SessionManager
+                SessionManager(message.from_user.id).delete_session()
+                logger.info(f"Cleared stale session for user {message.from_user.id} after failed login")
+            except Exception as clear_err:
+                logger.warning(f"Could not clear stale session: {clear_err}")
+
             await engine.close()
             _remove_engine(message.from_user.id)
             await processing.edit_text(

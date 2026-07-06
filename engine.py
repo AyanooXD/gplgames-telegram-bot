@@ -622,7 +622,7 @@ class SiteEngine:
                 return False
 
             content = await self._safe_get_content()
-            is_logged = "log out" in content.lower() or "logout" in content.lower()
+            is_logged = self._is_logged_in(content, self.page.url)
             return is_logged
 
         except Exception as e:
@@ -641,14 +641,47 @@ class SiteEngine:
             if not ok:
                 return False
 
+            current_url = self.page.url
+            logger.info(f"Login page URL after ensure_loaded: {current_url}")
             content = await self._safe_get_content()
+            content_lower = content.lower()
+
+            # Log what we actually got — helps diagnose stale-cookie redirects
+            title_match = re.search(r"<title>(.*?)</title>", content, re.I | re.DOTALL)
+            page_title = title_match.group(1).strip() if title_match else "(no title)"
+            logger.info(f"Login page title: {page_title!r}, content length: {len(content)}")
+
+            # Check if we're already logged in (e.g. valid cookies from before)
+            already_logged = self._is_logged_in(content, current_url)
+            if already_logged:
+                logger.info("Already logged in (cookies valid) — skipping credential entry")
+                await self.on_status("✅ Already logged in! Session is persistent.")
+                return True
+
             if "woocommerce-login-nonce" not in content:
-                await self.on_status("❌ Login page did not load properly.")
+                # Save a snippet for debugging
+                snippet = re.sub(r"\s+", " ", content_lower[:500])
+                logger.error(
+                    f"Login page did not load properly. URL={current_url}, "
+                    f"title={page_title!r}, snippet={snippet!r}"
+                )
+                await self.on_status(
+                    f"❌ Login page did not load properly.\n"
+                    f"URL: {current_url}\n"
+                    f"Title: {page_title}\n"
+                    f"Try /cookies for free login instead."
+                )
                 return False
 
             await self.on_status("🔐 Filling credentials...")
 
             email_input = self.page.locator('input#username')
+            username_count = await email_input.count()
+            logger.info(f"Username input found: {username_count} element(s)")
+            if username_count == 0:
+                logger.error("Username input not found on page")
+                await self.on_status("❌ Could not find username field. Page may have changed.")
+                return False
             await email_input.fill(email)
 
             pass_input = self.page.locator('input#password')
@@ -657,7 +690,14 @@ class SiteEngine:
             await asyncio.sleep(0.5)
 
             login_btn = self.page.locator('button[name="login"]')
+            btn_count = await login_btn.count()
+            logger.info(f"Login button found: {btn_count} element(s)")
+            if btn_count == 0:
+                logger.error("Login button not found on page")
+                await self.on_status("❌ Could not find login button. Page may have changed.")
+                return False
             await login_btn.click()
+            logger.info("Login button clicked, waiting for navigation...")
 
             # Wait for the post-login navigation. Don't use networkidle —
             # gplgames.net has continuous polling that prevents it from firing.
@@ -669,8 +709,11 @@ class SiteEngine:
                 pass
             await asyncio.sleep(2)
 
+            post_url = self.page.url
+            logger.info(f"Post-login URL: {post_url}")
             content = await self._safe_get_content()
-            is_logged = "log out" in content.lower() or "logout" in content.lower()
+            is_logged = self._is_logged_in(content, post_url)
+            logger.info(f"Logged-in check after submit: {is_logged}")
 
             if is_logged:
                 await self.on_status("✅ Login successful! Session is persistent.")
@@ -682,15 +725,65 @@ class SiteEngine:
                 )
                 if errors:
                     error_text = re.sub(r"<[^>]*>", "", errors[0]).strip()
+                    logger.warning(f"WooCommerce error shown: {error_text[:200]}")
                     await self.on_status(f"❌ Login failed: {error_text[:100]}")
                 else:
-                    await self.on_status("❌ Login failed. Check your credentials.")
+                    # Log diagnostic info so we can debug "silent" failures
+                    post_title_match = re.search(r"<title>(.*?)</title>", content, re.I | re.DOTALL)
+                    post_title = post_title_match.group(1).strip() if post_title_match else "(no title)"
+                    snippet = re.sub(r"\s+", " ", content.lower()[:400])
+                    logger.warning(
+                        f"Login failed silently. URL={post_url}, title={post_title!r}, "
+                        f"snippet={snippet!r}"
+                    )
+                    await self.on_status(
+                        "❌ Login failed. Check your credentials.\n"
+                        "💡 Try /cookies for free login (no captcha)."
+                    )
                 return False
 
         except Exception as e:
-            logger.error(f"Login error: {e}")
+            logger.error(f"Login error: {e}", exc_info=True)
             await self.on_status(f"❌ Login error: {str(e)[:100]}")
             return False
+
+    def _is_logged_in(self, content: str, current_url: str = "") -> bool:
+        """
+        Robust logged-in detection. Checks multiple signals:
+        - "log out" / "logout" / "sign out" text (case-insensitive)
+        - A hyperlink whose href contains 'logout' or 'customer-logout'
+        - WooCommerce my-account dashboard markers (only when login form is gone)
+
+        Returns True if a strong signal indicates the user is logged in.
+        """
+        content_lower = content.lower()
+
+        # Must NOT be on the bot verification page — that page has no login
+        # form but the user is definitely NOT logged in.
+        if "bot verification" in content_lower:
+            return False
+
+        # Signal 1: logout text anywhere on page (strongest signal)
+        if "log out" in content_lower or "logout" in content_lower or "sign out" in content_lower:
+            return True
+
+        # Signal 2: logout/logout link href
+        if re.search(r'href=["\'][^"\']*(?:logout|customer-logout)[^"\']*["\']', content_lower):
+            return True
+
+        # Signal 3: WooCommerce account dashboard markers + no login form.
+        # This catches themes that put the logout link behind a dropdown.
+        has_login_form = "woocommerce-login-nonce" in content_lower
+        has_account_dashboard = (
+            "woocommerce-my-account" in content_lower
+            or "woocommerce-account" in content_lower
+            or "account-content" in content_lower
+            or "account-navigation" in content_lower
+        )
+        if has_account_dashboard and not has_login_form:
+            return True
+
+        return False
 
     # ================================================================
     # URL VERIFICATION
@@ -1267,7 +1360,7 @@ async def _check_login_status(self) -> bool:
         if not ok:
             return False
         content = await self._safe_get_content()
-        return "log out" in content.lower() or "logout" in content.lower()
+        return self._is_logged_in(content, self.page.url)
     except Exception:
         return False
 
