@@ -2399,62 +2399,220 @@ async def _parse_payment_result(engine: SiteEngine, captured_events: dict = None
         url_success = "order-received" in final_url.lower()
 
         # ==================================================================
-        # SIGNAL 4: Page content markers
+        # SIGNAL 4: WooCommerce + RazorPay plugin HTML markers
+        # (Based on actual RazorPay WooCommerce plugin source code:
+        #  github.com/razorpay/razorpay-woocommerce — woo-razorpay.php)
         # ==================================================================
-        content_markers = {
-            "success": ["thank you", "order received", "order confirmed",
-                       "payment successful", "payment complete", "payment done",
-                       "thank you for your order", "your order is complete",
-                       "payment success", "transaction success"],
-            "failed":  ["payment failed", "transaction failed", "payment declined",
-                       "card declined", "payment unsuccessful", "transaction declined",
-                       "payment was declined", "your card was declined",
-                       "payment could not be processed", "transaction cannot be processed"],
-            "pending": ["payment pending", "transaction pending", "awaiting confirmation",
-                       "payment is being processed"],
-        }
 
-        detected_status = "unknown"
-        for marker in content_markers["success"]:
-            if marker in text_lower:
-                detected_status = "success"
-                break
-        if detected_status == "unknown":
-            for marker in content_markers["failed"]:
-                if marker in text_lower:
-                    detected_status = "failed"
-                    break
-        if detected_status == "unknown":
-            for marker in content_markers["pending"]:
-                if marker in text_lower:
-                    detected_status = "pending"
-                    break
+        # Check for WooCommerce thank-you page HTML classes (most reliable)
+        has_order_container = "woocommerce-order" in content_lower
+        has_success_notice = (
+            "woocommerce-thankyou-order-received" in content_lower
+            or "woocommerce-notice--success" in content_lower
+        )
+        has_failed_notice = (
+            "woocommerce-thankyou-order-failed" in content_lower
+            or "woocommerce-notice--error" in content_lower
+        )
+
+        # The RazorPay plugin overrides WooCommerce's default text with:
+        # "Thank you for shopping with us. Your account has been charged and
+        #  your transaction is successful. We will be processing your order soon."
+        # (Source: DEFAULT_SUCCESS_MESSAGE constant in woo-razorpay.php line 221)
+        razorpay_success_phrases = [
+            "your transaction is successful",
+            "your account has been charged",
+            "we will be processing your order soon",
+            "thank you for shopping with us",
+        ]
+        razorpay_success_hits = sum(1 for p in razorpay_success_phrases if p in text_lower)
+
+        # WooCommerce default text (if RazorPay filter is disabled)
+        wc_default_success = "thank you. your order has been received" in text_lower
+
+        # WooCommerce failure text
+        wc_failed_phrases = [
+            "unfortunately your order cannot be processed",
+            "originating bank/merchant has declined your transaction",
+            "please attempt your purchase again",
+        ]
+        wc_failed_hits = sum(1 for p in wc_failed_phrases if p in text_lower)
+
+        # RazorPay-specific decline text shown inside the modal
+        rzp_modal_failure_phrases = [
+            "payment failed", "transaction failed", "payment declined",
+            "card declined", "payment unsuccessful", "transaction declined",
+            "payment was declined", "your card was declined",
+            "payment could not be processed", "transaction cannot be processed",
+            "insufficient funds", "authentication failed",
+            "incorrect cvv", "invalid cvv", "card expired",
+            "payment timed out", "payment cancelled",
+        ]
+        rzp_failure_hits = sum(1 for p in rzp_modal_failure_phrases if p in text_lower)
+
+        # Pending markers
+        pending_phrases = [
+            "payment pending", "transaction pending", "awaiting confirmation",
+            "payment is being processed",
+        ]
+        pending_hits = sum(1 for p in pending_phrases if p in text_lower)
 
         # ==================================================================
-        # DECISION LOGIC — combine all signals
+        # SIGNAL 5: Extract order details from WooCommerce order-overview
+        # (These elements only appear on the success/thank-you page)
         # ==================================================================
-        if url_success:
+        try:
+            order_overview = await engine.page.evaluate(
+                """() => {
+                    const result = {};
+                    // Order number: <li class="woocommerce-order-overview__order order">
+                    const orderEl = document.querySelector('.woocommerce-order-overview__order strong, .woocommerce-order-overview__order .value');
+                    if (orderEl) result.order_number = orderEl.textContent.trim();
+                    // Total: <li class="woocommerce-order-overview__total total">
+                    const totalEl = document.querySelector('.woocommerce-order-overview__total strong, .woocommerce-order-overview__total .value');
+                    if (totalEl) result.total = totalEl.textContent.trim();
+                    // Payment method: <li class="woocommerce-order-overview__payment-method method">
+                    const methodEl = document.querySelector('.woocommerce-order-overview__payment-method strong, .woocommerce-order-overview__payment-method .value');
+                    if (methodEl) result.payment_method = methodEl.textContent.trim();
+                    // Date
+                    const dateEl = document.querySelector('.woocommerce-order-overview__date strong, .woocommerce-order-overview__date .value');
+                    if (dateEl) result.date = dateEl.textContent.trim();
+                    // Email
+                    const emailEl = document.querySelector('.woocommerce-order-overview__email strong, .woocommerce-order-overview__email .value');
+                    if (emailEl) result.email = emailEl.textContent.trim();
+                    // Main success message text
+                    const noticeEl = document.querySelector('.woocommerce-thankyou-order-received, .woocommerce-notice--success');
+                    if (noticeEl) result.notice_text = noticeEl.textContent.trim();
+                    return result;
+                }"""
+            )
+            if order_overview:
+                logger.info(f"WooCommerce order overview: {order_overview}")
+                if order_overview.get("order_number") and not result["order_id"]:
+                    result["order_id"] = order_overview["order_number"]
+                if order_overview.get("total") and not result["amount"]:
+                    # Extract numeric amount from "₹99.00" or "$99.00" etc.
+                    amt_match = re.search(r'([\d,]+\.?\d*)', order_overview["total"])
+                    if amt_match:
+                        result["amount"] = amt_match.group(1)
+                if order_overview.get("notice_text"):
+                    result["message"] = order_overview["notice_text"][:300]
+        except Exception as e:
+            logger.warning(f"Could not extract WooCommerce order overview: {e}")
+
+        # ==================================================================
+        # DECISION LOGIC — combine all signals (priority order)
+        # ==================================================================
+
+        # Priority 1: WooCommerce + RazorPay HTML markers (most authoritative
+        # for the thank-you page — these only appear after payment processing)
+        if has_success_notice and not has_failed_notice:
             result["status"] = "success"
             result["status_text"] = "Payment Approved"
-            result["message"] = "Payment completed successfully."
-        elif detected_status == "success":
-            result["status"] = "success"
-            result["status_text"] = "Payment Approved"
-            result["message"] = "Payment completed successfully."
-        elif detected_status == "failed":
+            # Use the RazorPay plugin's actual success message if present
+            if razorpay_success_hits >= 2:
+                result["message"] = (
+                    "Thank you for shopping with us. Your account has been charged "
+                    "and your transaction is successful. We will be processing your "
+                    "order soon."
+                )
+            elif not result["message"]:
+                result["message"] = "Payment completed successfully."
+            logger.info("Payment APPROVED via WooCommerce success notice marker")
+        elif has_failed_notice:
             result["status"] = "failed"
             result["status_text"] = "Payment Declined"
-            result["message"] = "Payment was declined or failed."
-        elif detected_status == "pending":
+            if wc_failed_hits > 0:
+                result["message"] = (
+                    "Unfortunately your order cannot be processed as the originating "
+                    "bank/merchant has declined your transaction. Please attempt your "
+                    "purchase again."
+                )
+            elif not result["message"]:
+                result["message"] = "Payment was declined or failed."
+            logger.info("Payment DECLINED via WooCommerce failure notice marker")
+
+        # Priority 2: URL pattern + order overview present
+        elif url_success and has_order_container:
+            result["status"] = "success"
+            result["status_text"] = "Payment Approved"
+            if razorpay_success_hits >= 2 and not result["message"]:
+                result["message"] = (
+                    "Thank you for shopping with us. Your account has been charged "
+                    "and your transaction is successful. We will be processing your "
+                    "order soon."
+                )
+            elif not result["message"]:
+                result["message"] = "Payment completed successfully."
+            logger.info("Payment APPROVED via URL pattern + order container")
+
+        # Priority 3: RazorPay plugin success text detected
+        elif razorpay_success_hits >= 2 or wc_default_success:
+            result["status"] = "success"
+            result["status_text"] = "Payment Approved"
+            if razorpay_success_hits >= 2:
+                result["message"] = (
+                    "Thank you for shopping with us. Your account has been charged "
+                    "and your transaction is successful. We will be processing your "
+                    "order soon."
+                )
+            else:
+                result["message"] = "Thank you. Your order has been received."
+            logger.info("Payment APPROVED via RazorPay/WooCommerce success text")
+
+        # Priority 4: WooCommerce failed text
+        elif wc_failed_hits > 0:
+            result["status"] = "failed"
+            result["status_text"] = "Payment Declined"
+            result["message"] = (
+                "Unfortunately your order cannot be processed as the originating "
+                "bank/merchant has declined your transaction. Please attempt your "
+                "purchase again."
+            )
+            logger.info("Payment DECLINED via WooCommerce failure text")
+
+        # Priority 5: RazorPay modal failure phrases
+        elif rzp_failure_hits > 0:
+            result["status"] = "failed"
+            result["status_text"] = "Payment Declined"
+            # Try to find which phrase matched for a better message
+            for phrase in rzp_modal_failure_phrases:
+                if phrase in text_lower:
+                    result["message"] = phrase.capitalize() + "."
+                    # Map to reason code
+                    reason_map = {
+                        "card declined":              "card_declined",
+                        "your card was declined":     "card_declined",
+                        "payment was declined":       "payment_declined",
+                        "payment declined":           "payment_declined",
+                        "insufficient funds":         "insufficient_funds",
+                        "authentication failed":      "authentication_failed",
+                        "incorrect cvv":              "incorrect_cvv",
+                        "invalid cvv":                "incorrect_cvv",
+                        "card expired":               "card_expired",
+                        "payment timed out":          "payment_timed_out",
+                        "payment cancelled":          "payment_cancelled",
+                    }
+                    for pattern, reason in reason_map.items():
+                        if pattern in text_lower:
+                            result["decline_reason"] = reason
+                            result["message"] = RZP_REASON_MESSAGES.get(reason, result["message"])
+                            break
+                    break
+            logger.info("Payment DECLINED via RazorPay failure phrase")
+
+        # Priority 6: Pending markers
+        elif pending_hits > 0:
             result["status"] = "pending"
             result["status_text"] = "Payment Pending"
             result["message"] = "Payment is pending. Check your bank."
+            logger.info("Payment PENDING via pending markers")
+
+        # Priority 7: Modal still open + in-modal error
         elif modal_still_open and in_modal_error:
-            # Modal still open + error text visible = declined
             result["status"] = "failed"
             result["status_text"] = "Payment Declined"
             result["message"] = in_modal_error
-            # Try to match against known reason patterns
             err_lower = in_modal_error.lower()
             reason_map = {
                 "card_declined":              ["card declined", "card was declined", "your card was declined"],
@@ -2470,18 +2628,25 @@ async def _parse_payment_result(engine: SiteEngine, captured_events: dict = None
                     result["decline_reason"] = reason
                     result["message"] = RZP_REASON_MESSAGES.get(reason, in_modal_error)
                     break
+            logger.info("Payment DECLINED via modal still open + error text")
+
+        # Priority 8: Modal still open (silent failure)
         elif modal_still_open:
-            # Modal still open but no error text yet — likely still processing or failed silently
             result["status"] = "failed"
             result["status_text"] = "Payment Declined"
             result["message"] = "Payment was declined or cancelled. Modal remained open."
+            logger.info("Payment DECLINED via modal still open (no error text)")
+
+        # Priority 9: Payment ID present (success signal)
         elif result["payment_id"]:
-            # No explicit success markers, but a payment ID exists — treat as success
             result["status"] = "success"
             result["status_text"] = "Payment Approved"
-            result["message"] = "Payment completed successfully."
+            if not result["message"]:
+                result["message"] = "Payment completed successfully."
+            logger.info("Payment APPROVED via payment ID presence")
+
+        # Priority 10: Fallback — check WooCommerce error notices
         else:
-            # Fallback — check for WooCommerce error notices
             errors = re.findall(
                 r'<ul[^>]*class="[^"]*error[^"]*"[^>]*>(.*?)</ul>',
                 content, re.DOTALL | re.I
