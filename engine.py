@@ -231,6 +231,189 @@ class SiteEngine:
             logger.error(f"Nopecha solve error: {e}")
             return None
 
+    async def _inject_token_and_wait(self, page: Page, token: str, url: str) -> bool:
+        """
+        Core injection logic — tries multiple methods to submit the reCAPTCHA
+        token to LiteSpeed. Returns True if verification passed.
+        """
+
+        # ------------------------------------------------------------------
+        # METHOD 1: Find and call the reCAPTCHA data-callback directly.
+        # This is the CORRECT way — LiteSpeed registers a JS callback that
+        # POSTs the token to its verification endpoint, sets cookies, then
+        # reloads.  Just setting the textarea + form.submit() bypasses this.
+        # ------------------------------------------------------------------
+        callback_result = await page.evaluate(
+            """(token) => {
+                // 1a. Look for data-callback on the .g-recaptcha div
+                const rcDiv = document.querySelector('.g-recaptcha') ||
+                              document.querySelector('[data-sitekey]') ||
+                              document.querySelector('[data-callback]');
+                if (rcDiv) {
+                    const cbName = rcDiv.getAttribute('data-callback');
+                    if (cbName && typeof window[cbName] === 'function') {
+                        // Inject token into textarea first (callback may read it)
+                        const ta = document.getElementById('g-recaptcha-response');
+                        if (ta) { ta.value = token; ta.style.display = 'block'; }
+                        try { window[cbName](token); return 'callback:' + cbName; }
+                        catch(e) { return 'callback_error:' + e.message; }
+                    }
+                }
+
+                // 1b. Check grecaptcha's internal client config for callback
+                try {
+                    const cfg = window.___grecaptcha_cfg;
+                    if (cfg && cfg.clients) {
+                        for (const cid in cfg.clients) {
+                            const cl = cfg.clients[cid];
+                            if (cl) {
+                                // Check all properties for a function callback
+                                for (const prop of ['callback', 'onSuccess', 'successCb']) {
+                                    if (typeof cl[prop] === 'function') {
+                                        const ta = document.getElementById('g-recaptcha-response');
+                                        if (ta) { ta.value = token; ta.style.display = 'block'; }
+                                        try { cl[prop](token); return 'cfg:' + prop; }
+                                        catch(e) { /* continue */ }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch(e) { /* not available */ }
+
+                return null;
+            }""",
+            token,
+        )
+
+        if (callback_result and callback_result.startswith("callback:")) or (
+            callback_result and callback_result.startswith("cfg:")
+        ):
+            method_name = callback_result.split(":")[0] + " " + callback_result.split(":", 1)[1]
+            await self.on_status(f"🔄 Triggered {method_name}, waiting for redirect...")
+
+            # Wait for the callback to do its thing (POST + reload)
+            try:
+                async with page.expect_navigation(timeout=15000, wait_until="domcontentloaded"):
+                    pass
+            except Exception:
+                # expect_navigation timed out — callback may have failed silently
+                await asyncio.sleep(2)
+
+            if "Bot Verification" not in await page.content():
+                await self.on_status("✅ Verification passed!")
+                return True
+
+        elif callback_result and "error" in callback_result:
+            logger.warning(f"Callback invocation failed: {callback_result}")
+
+        # ------------------------------------------------------------------
+        # METHOD 2: Inject + dispatch events + form submit (old approach,
+        # improved with events so React/Vue/jQuery pick up the change).
+        # ------------------------------------------------------------------
+        await self.on_status("🔄 Trying form submission...")
+        await page.evaluate(
+            """(token) => {
+                const ta = document.getElementById('g-recaptcha-response');
+                if (ta) {
+                    ta.value = token;
+                    ta.style.display = 'block';
+                    ta.dispatchEvent(new Event('input', {bubbles: true}));
+                    ta.dispatchEvent(new Event('change', {bubbles: true}));
+                }
+            }""",
+            token,
+        )
+        await asyncio.sleep(0.5)
+
+        form_found = await page.evaluate("""() => {
+            // Try multiple form selectors
+            const selectors = [
+                '#lsrecaptcha-form',
+                'form[action*="verify"]',
+                'form[action*="lscache"]',
+                'form[action*="captcha"]',
+                'form'
+            ];
+            for (const sel of selectors) {
+                const form = document.querySelector(sel);
+                if (form) {
+                    try { form.submit(); return sel; }
+                    catch(e) { /* try next */ }
+                }
+            }
+            return null;
+        }""")
+
+        if form_found:
+            await self.on_status(f"🔄 Submitted form ({form_found}), waiting...")
+            try:
+                async with page.expect_navigation(timeout=12000, wait_until="domcontentloaded"):
+                    pass
+            except Exception:
+                await asyncio.sleep(3)
+
+            if "Bot Verification" not in await page.content():
+                await self.on_status("✅ Verification passed!")
+                return True
+
+        # ------------------------------------------------------------------
+        # METHOD 3: Manually POST the token to common LiteSpeed verify
+        # endpoints using the browser's fetch (same origin, cookies sent).
+        # ------------------------------------------------------------------
+        await self.on_status("🔄 Trying direct token POST...")
+        posted = await page.evaluate(
+            """(token) => {
+                const endpoints = [
+                    '/__lscache/verify',
+                    '/wp-content/plugins/litespeed-cache/guest.vary.php',
+                    '/?lscache_verify=1'
+                ];
+                // Try each endpoint
+                for (const ep of endpoints) {
+                    try {
+                        const fd = new FormData();
+                        fd.append('g-recaptcha-response', token);
+                        const xhr = new XMLHttpRequest();
+                        xhr.open('POST', ep, false); // synchronous
+                        xhr.send(fd);
+                        if (xhr.status === 200) return ep + ' -> ' + xhr.status;
+                    } catch(e) { /* try next */ }
+                }
+                return null;
+            }""",
+            token,
+        )
+
+        if posted:
+            await self.on_status(f"🔄 POSTed token ({posted}), reloading...")
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(2)
+            except Exception:
+                await asyncio.sleep(3)
+
+            if "Bot Verification" not in await page.content():
+                await self.on_status("✅ Verification passed!")
+                return True
+
+        # ------------------------------------------------------------------
+        # METHOD 4: Navigate to target URL — maybe the callback already
+        # set the verification cookie and a simple navigation works.
+        # ------------------------------------------------------------------
+        await self.on_status("🔄 Navigating to target page...")
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(3)
+            if "Bot Verification" not in await page.content():
+                await self.on_status("✅ Verification passed!")
+                return True
+        except Exception:
+            pass
+
+        # All methods failed
+        return False
+
     async def _solve_captcha_and_navigate(self, page: Page, url: str) -> bool:
         """
         If page shows LiteSpeed Bot Verification, solve reCAPTCHA via Nopecha
@@ -257,56 +440,13 @@ class SiteEngine:
 
         await self.on_status("✅ Captcha solved! Injecting token...")
 
-        # Inject the token into the verification form
-        await page.evaluate(
-            """(token) => {
-                const ta = document.getElementById('g-recaptcha-response');
-                if (ta) {
-                    ta.value = token;
-                    ta.style.display = 'block';
-                }
-            }""",
-            token,
-        )
-        await asyncio.sleep(1)
+        passed = await self._inject_token_and_wait(page, token, url)
 
-        # Submit the LiteSpeed verification form
-        try:
-            await page.evaluate(
-                """() => {
-                    const form = document.getElementById('lsrecaptcha-form');
-                    if (form) form.submit();
-                }"""
-            )
-        except Exception:
-            pass
+        if not passed:
+            await self.on_status("❌ Verification failed after all attempts.\n\n💡 Use /cookies for free login (no captcha needed).")
+            return False
 
-        # Wait for navigation after form submit
-        try:
-            await page.wait_for_load_state("networkidle", timeout=20000)
-        except Exception:
-            await asyncio.sleep(5)
-
-        # Check if verification passed
-        new_content = await page.content()
-        if "Bot Verification" not in new_content:
-            await self.on_status("✅ Verification passed!")
-            return True
-
-        # If still on verification page, the token might have been rejected.
-        # Try navigating directly to the target URL with our new cookies.
-        await self.on_status("🔄 Navigating to target page...")
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(3)
-            final_content = await page.content()
-            if "Bot Verification" not in final_content:
-                return True
-        except Exception:
-            pass
-
-        await self.on_status("❌ Verification failed. Try /cookies instead.")
-        return False
+        return True
 
     async def _ensure_page_loaded(self, url: str) -> bool:
         """
