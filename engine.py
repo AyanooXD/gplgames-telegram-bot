@@ -1208,9 +1208,9 @@ class SiteEngine:
 
     def _generate_random_billing(self, existing: dict | None = None) -> dict:
         """
-        Generate realistic random Indian billing details for any fields that
-        are NOT already in `existing`. Used when the user doesn't provide
-        billing details manually.
+        Generate realistic random billing details for any fields that
+        are NOT already in `existing`. Uses NON-INDIA countries only
+        (US, UK, Canada, Australia, Germany, Singapore, UAE) per user request.
 
         Returns a dict with billing_* keys ready to be passed to
         fill_and_submit_checkout().
@@ -1221,52 +1221,103 @@ class SiteEngine:
         existing = existing or {}
         out = {}
 
-        # Indian first names (mix of common Hindu/Muslim/Sikh/Christian names)
+        # International first names
         first_names = [
-            "Aarav", "Vivaan", "Aditya", "Vihaan", "Arjun", "Sai", "Reyansh",
-            "Ayaan", "Krishna", "Ishaan", "Rahul", "Amit", "Suresh", "Rajesh",
-            "Ananya", "Aadhya", "Aaradhya", "Saanvi", "Priya", "Pooja", "Kavya",
-            "Diya", "Anika", "Navya", "Myra", "Anjali", "Deepa", "Sneha",
+            "James", "John", "Robert", "Michael", "David", "William", "Thomas",
+            "Daniel", "Matthew", "Christopher", "Andrew", "Joseph", "Ryan",
+            "Sarah", "Emily", "Jessica", "Ashley", "Amanda", "Megan", "Lauren",
+            "Sophie", "Olivia", "Hannah", "Grace", "Chloe", "Tyler", "Kevin",
+            "Eric", "Jason", "Justin", "Marcus", "Marcus", "Dylan", "Logan",
         ]
         last_names = [
-            "Sharma", "Verma", "Gupta", "Patel", "Singh", "Kumar", "Reddy",
-            "Nair", "Iyer", "Mehta", "Joshi", "Agarwal", "Bhat", "Rao",
-            "Das", "Banerjee", "Chatterjee", "Mukherjee", "Khan", "Ali",
+            "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller",
+            "Davis", "Rodriguez", "Martinez", "Hernandez", "Lopez", "Wilson",
+            "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin", "Lee",
+            "Thompson", "White", "Harris", "Clark", "Lewis", "Walker", "Hall",
+            "Young", "King", "Wright", "Scott", "Green", "Baker", "Adams",
         ]
 
-        # Indian cities with their states and pincodes (real, valid combos)
-        locations = [
-            ("Mumbai",    "MH", "400001"),  # Fort, Mumbai
-            ("Delhi",     "DL", "110001"),  # Connaught Place
-            ("Bengaluru", "KA", "560001"),  # MG Road
-            ("Hyderabad", "TG", "500001"),  # Charminar
-            ("Chennai",   "TN", "600001"),  # Parry's Corner
-            ("Kolkata",   "WB", "700001"),  # BBD Bagh
-            ("Pune",      "MH", "411001"),  # Pune City
-            ("Ahmedabad", "GJ", "380001"),  # Kolkata
-            ("Jaipur",    "RJ", "302001"),  # Jaipur City
-            ("Lucknow",   "UP", "226001"),  # Hazratganj
-            ("Chandigarh","CH", "160001"),  # Sector 1
-            ("Indore",    "MP", "452001"),  # Indore City
-            ("Surat",     "GJ", "395001"),  # Surat City
-            ("Nagpur",    "MH", "440001"),  # Sitabuldi
+        # Non-India countries with real city/state/postcode combos
+        # Format: (country_code, [(city, state, postcode), ...], phone_prefix, phone_len)
+        countries = [
+            ("US", [
+                ("New York",     "NY", "10001"),
+                ("Los Angeles",  "CA", "90001"),
+                ("Chicago",      "IL", "60601"),
+                ("Houston",      "TX", "77001"),
+                ("Phoenix",      "AZ", "85001"),
+                ("Philadelphia", "PA", "19101"),
+                ("San Diego",    "CA", "92101"),
+                ("Dallas",       "TX", "75201"),
+                ("Seattle",      "WA", "98101"),
+                ("Boston",       "MA", "02101"),
+            ], "+1", 10),
+            ("GB", [
+                ("London",     "ENG", "SW1A 1AA"),
+                ("Manchester", "ENG", "M1 1AE"),
+                ("Birmingham", "ENG", "B1 1AA"),
+                ("Leeds",      "ENG", "LS1 1AA"),
+                ("Glasgow",    "SCT", "G1 1AA"),
+                ("Liverpool",  "ENG", "L1 1AA"),
+                ("Bristol",    "ENG", "BS1 1AA"),
+                ("Edinburgh",  "SCT", "EH1 1AA"),
+            ], "+44", 10),
+            ("CA", [
+                ("Toronto",    "ON", "M5H 2N2"),
+                ("Vancouver",  "BC", "V6B 1A1"),
+                ("Montreal",   "QC", "H3A 1A1"),
+                ("Calgary",    "AB", "T2P 1A1"),
+                ("Ottawa",     "ON", "K1A 1A1"),
+                ("Edmonton",   "AB", "T5J 1A1"),
+            ], "+1", 10),
+            ("AU", [
+                ("Sydney",     "NSW", "2000"),
+                ("Melbourne",  "VIC", "3000"),
+                ("Brisbane",   "QLD", "4000"),
+                ("Perth",      "WA",  "6000"),
+                ("Adelaide",   "SA",  "5000"),
+                ("Gold Coast", "QLD", "4217"),
+            ], "+61", 9),
+            ("DE", [
+                ("Berlin",    "BE", "10115"),
+                ("Munich",    "BY", "80331"),
+                ("Hamburg",   "HH", "20095"),
+                ("Cologne",   "NW", "50667"),
+                ("Frankfurt", "HE", "60311"),
+                ("Stuttgart", "BW", "70173"),
+            ], "+49", 10),
+            ("SG", [
+                ("Singapore", "Singapore", "018989"),
+                ("Singapore", "Singapore", "048583"),
+                ("Singapore", "Singapore", "238801"),
+            ], "+65", 8),
+            ("AE", [
+                ("Dubai",     "Dubai",     "00000"),
+                ("Abu Dhabi", "Abu Dhabi", "00000"),
+                ("Sharjah",   "Sharjah",   "00000"),
+            ], "+971", 9),
         ]
 
-        # Street names (realistic Indian address format)
+        # Pick a random non-India country
+        country_code, locations, phone_prefix, phone_len = random.choice(countries)
+        city, state, postcode = random.choice(locations)
+
+        # Street names
         street_names = [
-            "MG Road", "Station Road", "Civil Lines", "Model Town",
-            "Rajaji Marg", "Jawahar Lane", "Gandhi Nagar", "Nehru Street",
-            "Patel Marg", "Subhash Road", "Indira Colony", "Shastri Nagar",
+            "Main St", "High St", "King St", "Queen St", "Church St",
+            "Park Ave", "Oak Ave", "Maple Dr", "Cedar Ln", "Pine Rd",
+            "Elm St", "Washington St", "Lincoln Ave", "Victoria Rd",
+            "Albert St", "James St", "George St", "Mill Lane", "Station Rd",
         ]
 
-        # Generate a stable random email handle so first + last name + email match
+        # Generate values
         first = existing.get("billing_first_name") or random.choice(first_names)
         last = existing.get("billing_last_name") or random.choice(last_names)
-        city, state, pincode = random.choice(locations)
         street = random.choice(street_names)
         house_num = random.randint(1, 999)
-        phone = "9" + "".join(random.choices(string.digits, k=9))  # Indian mobile
-        email_handle = (first + last).lower() + str(random.randint(100, 9999))
+        phone_digits = "".join(random.choices(string.digits, k=phone_len))
+        phone = f"{phone_prefix}{phone_digits}"
+        email_handle = (first + last).lower().replace(" ", "") + str(random.randint(100, 9999))
         email = f"{email_handle}@gmail.com"
 
         # Only fill fields that aren't already in `existing`
@@ -1279,19 +1330,19 @@ class SiteEngine:
         if "billing_phone" not in existing:
             out["billing_phone"] = phone
         if "billing_address_1" not in existing:
-            out["billing_address_1"] = f"{house_num}, {street}"
+            out["billing_address_1"] = f"{house_num} {street}"
         if "billing_city" not in existing:
             out["billing_city"] = city
         if "billing_state" not in existing:
             out["billing_state"] = state
         if "billing_postcode" not in existing:
-            out["billing_postcode"] = pincode
+            out["billing_postcode"] = postcode
         if "billing_country" not in existing:
-            out["billing_country"] = "IN"
+            out["billing_country"] = country_code
 
         logger.info(
-            f"Generated random billing for missing fields: "
-            f"{first} {last}, {city} {state} {pincode}, {email}"
+            f"Generated billing: {first} {last}, {city}, {country_code} "
+            f"{postcode}, {email}, {phone}"
         )
         return out
 
@@ -1955,19 +2006,135 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
         logger.error("Could not find/click RazorPay pay button in any frame")
 
     await asyncio.sleep(8)
+
+    # Parse the payment result from the final page
+    result = await _parse_payment_result(engine)
+    return result
+
+
+async def _parse_payment_result(engine: SiteEngine) -> dict:
+    """
+    Parse the final page after payment to extract order/payment details.
+    Extracts: order ID, order key, RazorPay payment ID, amount, status.
+    """
+    result = {
+        "status": "unknown",
+        "order_id": "",
+        "order_key": "",
+        "payment_id": "",
+        "amount": "",
+        "status_text": "",
+        "url": "",
+        "message": "",
+    }
+
     try:
-        final_url = engine.page.url
-        final_text = await engine.page.inner_text("body")
-        if "thank" in final_text.lower() or "order-received" in final_url:
-            return {"status": "success", "message": "Payment completed successfully!", "url": final_url}
-        return {
-            "status": "needs_review",
-            "message": "Payment submitted. Check email/WhatsApp for confirmation.",
-            "url": final_url,
-            "page_text": final_text[:300],
-        }
-    except Exception:
-        return {"status": "needs_review", "message": "Payment submitted. Verify manually."}
+        final_url = engine.page.url or ""
+        result["url"] = final_url
+        logger.info(f"Parsing payment result from URL: {final_url}")
+
+        # Extract order ID from URL patterns:
+        #   order-received/12345/?key=wc_order_XXX
+        #   order-pay/12345/?key=wc_order_XXX
+        order_match = re.search(r'order-(?:received|pay)/(\d+)', final_url, re.I)
+        if order_match:
+            result["order_id"] = order_match.group(1)
+
+        key_match = re.search(r'key=(wc_order_\w+)', final_url, re.I)
+        if key_match:
+            result["order_key"] = key_match.group(1)
+
+        # Get page content + visible text
+        content = await engine._safe_get_content()
+        try:
+            text = await engine.page.inner_text("body")
+        except Exception:
+            text = content
+
+        text_lower = text.lower()
+        content_lower = content.lower()
+
+        # Determine payment status from URL + content
+        if "order-received" in final_url.lower():
+            result["status"] = "success"
+            result["status_text"] = "Payment Successful"
+        elif "thank" in text_lower and "order" in text_lower:
+            result["status"] = "success"
+            result["status_text"] = "Payment Successful"
+        elif any(x in text_lower for x in ["payment failed", "transaction failed",
+                                            "payment declined", "card declined"]):
+            result["status"] = "failed"
+            result["status_text"] = "Payment Failed"
+        elif "pending" in text_lower and "payment" in text_lower:
+            result["status"] = "pending"
+            result["status_text"] = "Payment Pending"
+
+        # Extract RazorPay payment ID (patterns: pay_XXX, rp_XXX, rzp_XXX)
+        rzp_match = re.search(r'(pay_[A-Za-z0-9]{10,}|rp_[A-Za-z0-9]{10,}|rzp_[A-Za-z0-9]{10,})', content)
+        if rzp_match:
+            result["payment_id"] = rzp_match.group(1)
+
+        # Also try from visible text
+        if not result["payment_id"]:
+            rzp_match = re.search(r'(pay_[A-Za-z0-9]{10,}|rp_[A-Za-z0-9]{10,})', text)
+            if rzp_match:
+                result["payment_id"] = rzp_match.group(1)
+
+        # Extract amount (₹, Rs, INR, $, etc.)
+        amount_match = re.search(r'(?:₹|Rs\.?\s*|INR\s*|\$)\s*([\d,]+\.?\d*)', text)
+        if amount_match:
+            result["amount"] = amount_match.group(1)
+
+        # Extract WooCommerce order number from text (if not from URL)
+        if not result["order_id"]:
+            order_num_match = re.search(r'Order\s*(?:No\.?|Number|#)\s*:?\s*(\d+)', text, re.I)
+            if order_num_match:
+                result["order_id"] = order_num_match.group(1)
+
+        # Extract WooCommerce error/notices
+        errors = re.findall(
+            r'<ul[^>]*class="[^"]*error[^"]*"[^>]*>(.*?)</ul>',
+            content, re.DOTALL | re.I
+        )
+        if errors:
+            error_text = re.sub(r"<[^>]*>", "", errors[0]).strip()
+            result["message"] = error_text[:300]
+            if result["status"] in ("unknown", ""):
+                result["status"] = "failed"
+                result["status_text"] = "Payment Error"
+
+        # Also check for woocommerce-notice messages
+        if not result["message"]:
+            notices = re.findall(
+                r'<div[^>]*class="[^"]*woocommerce-notice[^"]*"[^>]*>(.*?)</div>',
+                content, re.DOTALL | re.I
+            )
+            if notices:
+                notice_text = re.sub(r"<[^>]*>", "", notices[0]).strip()
+                result["message"] = notice_text[:300]
+
+        # Set default message based on status if none found
+        if not result["message"]:
+            if result["status"] == "success":
+                result["message"] = "Payment completed successfully."
+            elif result["status"] == "failed":
+                result["message"] = "Payment was declined or failed."
+            elif result["status"] == "pending":
+                result["message"] = "Payment is pending. Check your bank."
+            else:
+                result["message"] = "Payment submitted. Verify manually."
+
+        logger.info(
+            f"Payment result: status={result['status']}, order_id={result['order_id']}, "
+            f"payment_id={result['payment_id']}, amount={result['amount']}"
+        )
+
+    except Exception as e:
+        logger.error(f"Error parsing payment result: {e}", exc_info=True)
+        result["status"] = "needs_review"
+        result["message"] = f"Could not parse payment result: {str(e)[:100]}"
+
+    return result
 
 
 async def _fill_razorpay_in_frame(engine: SiteEngine, frame) -> dict:
@@ -2016,17 +2183,9 @@ async def _fill_razorpay_in_frame(engine: SiteEngine, frame) -> dict:
             await pay_btn.click()
 
         await asyncio.sleep(8)
-        final_url = engine.page.url
-        final_text = await engine.page.inner_text("body")
 
-        if "thank" in final_text.lower() or "order-received" in final_url:
-            return {"status": "success", "message": "Payment completed!", "url": final_url}
-
-        return {
-            "status": "needs_review",
-            "message": "Payment submitted. Check email for confirmation.",
-            "url": final_url,
-        }
+        # Parse the payment result from the final page
+        return await _parse_payment_result(engine)
     except Exception as e:
         return {"status": "error", "message": str(e)[:200]}
 
