@@ -695,6 +695,19 @@ async def process_cvv(message: Message, state: FSMContext) -> None:
             f"💬 {html.escape(msg)}\n\n"
             "<i>Check your bank app or email for updates.</i>"
         )
+    elif status == "error":
+        # Bot error (not a decline) — pay button not found, card fill failed, etc.
+        response_text = (
+            "⚠️ <b>Bot Error — Payment Not Submitted</b>\n\n"
+            f"💬 {html.escape(msg)}\n\n"
+            "🔧 <b>This is a bot issue, not a card decline.</b>\n"
+            "The payment was never actually submitted to RazorPay.\n\n"
+            "💡 <b>What to do:</b>\n"
+            "• Try again with <code>/seturl</code>\n"
+            "• If it keeps failing, check <code>logs/bot_full.log</code>\n"
+            "• The bot developer needs to update the RazorPay selectors\n\n"
+            "<i>Send <code>/seturl</code> to try again</i>"
+        )
     else:
         # Failed/declined — show decline reason if we have it
         details_lines = []

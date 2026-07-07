@@ -1713,11 +1713,16 @@ async def _find_card_input_in_frame(frame, field_type: str = "number") -> any:
 
     field_type: 'number', 'expiry', or 'cvv'
     """
-    # Strategy 1: Traditional named inputs (old RazorPay UI)
+    # Strategy 1: Traditional named inputs (old + new RazorPay UI)
+    # Old UI uses bracket notation: card[number], card[expiry], card[cvv]
+    # New Tata Neu UI uses dot notation: card.number, card.expiry, card.cvv
     name_patterns = {
-        "number":  ["card[number]", "card_number", "cardNumber", "cc-number"],
-        "expiry":  ["card[expiry]", "card_expiry", "cardExpiry", "cc-exp"],
-        "cvv":     ["card[cvv]", "card_cvv", "cardCvv", "cc-csc", "cc-cvv"],
+        "number":  ["card[number]", "card_number", "cardNumber", "cc-number",
+                    "card.number", "card.number.input", "card-number-input"],
+        "expiry":  ["card[expiry]", "card_expiry", "cardExpiry", "cc-exp",
+                    "card.expiry", "card.expiry.input", "card-expiry-input"],
+        "cvv":     ["card[cvv]", "card_cvv", "cardCvv", "cc-csc", "cc-cvv",
+                    "card.cvv", "card.cvv.input", "card-cvv-input"],
     }
     for name in name_patterns.get(field_type, []):
         try:
@@ -1792,15 +1797,29 @@ async def _find_card_input_in_frame(frame, field_type: str = "number") -> any:
     except Exception:
         pass
 
-    # Strategy 6: Placeholder-based
+    # Strategy 6: Placeholder-based (exact placeholders seen in Tata Neu UI)
     placeholder_patterns = {
-        "number":  ["card number", "0000 0000", "1234 5678", "•"],
-        "expiry":  ["mm/yy", "MM/YY", "expiry", "MMYY"],
-        "cvv":     ["cvv", "cvc", "123"],
+        "number":  ["card number", "0000 0000", "1234 5678", "•", "0000"],
+        "expiry":  ["mm / yy", "mm/yy", "MM/YY", "MMYY", "expiry", "mm / yy"],
+        "cvv":     ["cvv", "cvc", "123", "•••"],
     }
     for ph in placeholder_patterns.get(field_type, []):
         try:
             loc = frame.locator(f'input[placeholder*="{ph}" i]')
+            if await loc.count() > 0:
+                return loc.first
+        except Exception:
+            pass
+
+    # Strategy 7: aria-label based (Tata Neu UI uses aria-label="Card Number", "MM / YY", "CVV")
+    aria_label_patterns = {
+        "number":  ["card number", "Card Number"],
+        "expiry":  ["mm / yy", "MM / YY", "expiry", "Expiry"],
+        "cvv":     ["cvv", "CVV", "cvc", "CVC", "security code"],
+    }
+    for al in aria_label_patterns.get(field_type, []):
+        try:
+            loc = frame.locator(f'input[aria-label="{al}"], input[aria-label="{al.upper()}"]')
             if await loc.count() > 0:
                 return loc.first
         except Exception:
@@ -1983,27 +2002,56 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
     await _inject_razorpay_event_listeners(engine)
 
     # Click pay button — search ALL frames, not just the ones we filled
+    # RazorPay UI variants use different button text: "Pay", "Pay Now", "Continue"
     pay_clicked = False
     for frame in engine.page.frames:
         if "razorpay" not in (frame.url or "").lower():
             continue
         for selector in [
+            # Class/ID based
             'button[class*="pay"]',
             'button#pay-button',
-            'button:has-text("Pay")',
-            'button:has-text("pay")',
-            'input[type="submit"][value*="Pay"]',
-            'button[type="submit"]',
             '#checkout-pay',
             'button.btn-primary',
+            # Type + name based (Tata Neu uses name="button" type="submit")
+            'button[type="submit"][name="button"]',
+            'button[type="submit"]:not([class*="hidden"])',
+            # Text based — "Pay", "Pay Now", "Continue" (Tata Neu uses "Continue")
+            'button:has-text("Pay")',
+            'button:has-text("Pay Now")',
+            'button:has-text("Pay now")',
+            'button:has-text("CONTINUE")',
+            'button:has-text("Continue")',
+            'button:has-text("continue")',
+            'button:has-text("Submit")',
+            'input[type="submit"][value*="Pay"]',
+            'input[type="submit"][value*="Continue"]',
         ]:
             try:
                 pay_btn = frame.locator(selector)
                 if await pay_btn.count() > 0:
-                    if await pay_btn.first.is_visible(timeout=2000):
-                        await pay_btn.first.click()
-                        pay_clicked = True
-                        logger.info(f"Pay button clicked in frame {frame.url} with selector {selector}")
+                    # Try each match — first visible one
+                    for i in range(min(await pay_btn.count(), 5)):
+                        try:
+                            el = pay_btn.nth(i)
+                            if await el.is_visible(timeout=2000):
+                                # Skip offer/promo buttons (they contain "Offers", "View all", "Refresh", "Using as")
+                                try:
+                                    btn_text = await el.inner_text(timeout=500)
+                                    btn_text_lower = btn_text.lower().strip()
+                                    skip_phrases = ["offers", "view all", "refresh", "using as", "privacy", "edit preferences"]
+                                    if any(skip in btn_text_lower for skip in skip_phrases):
+                                        logger.debug(f"Skipping non-pay button: {btn_text!r}")
+                                        continue
+                                except Exception:
+                                    pass
+                                await el.click()
+                                pay_clicked = True
+                                logger.info(f"Pay button clicked in frame {frame.url} with selector {selector} (match #{i})")
+                                break
+                        except Exception:
+                            continue
+                    if pay_clicked:
                         break
             except Exception:
                 continue
@@ -2012,6 +2060,32 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
 
     if not pay_clicked:
         logger.error("Could not find/click RazorPay pay button in any frame")
+        # Dump all visible submit buttons for debugging
+        try:
+            for frame in engine.page.frames:
+                if "razorpay" not in (frame.url or "").lower():
+                    continue
+                btns = await frame.evaluate(
+                    """() => {
+                        const out = [];
+                        for (const b of document.querySelectorAll('button, input[type="submit"]')) {
+                            if (b.offsetParent !== null) {
+                                out.push({
+                                    tag: b.tagName,
+                                    type: b.type,
+                                    name: b.name,
+                                    text: (b.textContent || b.value || '').trim().substring(0, 50),
+                                    cls: (b.className || '').substring(0, 60),
+                                });
+                            }
+                        }
+                        return out;
+                    }"""
+                )
+                if btns:
+                    logger.info(f"Visible buttons in {frame.url[:80]}: {btns}")
+        except Exception:
+            pass
 
     # Wait for payment to process — RazorPay needs time to call the bank,
     # get a response, and either close the modal (success) or show an error
@@ -2022,7 +2096,8 @@ async def _fill_razorpay_modal(engine: SiteEngine) -> dict:
     logger.info(f"Captured RazorPay events: {captured_events}")
 
     # Parse the payment result from the final page + captured events
-    result = await _parse_payment_result(engine, captured_events)
+    # Pass pay_clicked so the parser knows whether payment was actually submitted
+    result = await _parse_payment_result(engine, captured_events, pay_clicked)
     return result
 
 
@@ -2208,7 +2283,7 @@ RZP_ERROR_CODE_STATUS = {
 }
 
 
-async def _parse_payment_result(engine: SiteEngine, captured_events: dict = None) -> dict:
+async def _parse_payment_result(engine: SiteEngine, captured_events: dict = None, pay_clicked: bool = True) -> dict:
     """
     Parse the final page after payment to extract order/payment details AND
     determine the authoritative payment status.
@@ -2222,6 +2297,10 @@ async def _parse_payment_result(engine: SiteEngine, captured_events: dict = None
     6. WooCommerce error/notices
 
     Extracts: order ID, order key, payment ID, amount, status, decline reason.
+
+    pay_clicked: whether the Pay/Continue button was actually clicked. If False,
+                 "modal still open" should NOT be interpreted as a decline —
+                 it means payment was never submitted.
     """
     if captured_events is None:
         captured_events = {"success": None, "failure": None, "dismiss": None}
@@ -2614,8 +2693,8 @@ async def _parse_payment_result(engine: SiteEngine, captured_events: dict = None
             result["message"] = "Payment is pending. Check your bank."
             logger.info("Payment PENDING via pending markers")
 
-        # Priority 7: Modal still open + in-modal error
-        elif modal_still_open and in_modal_error:
+        # Priority 7: Modal still open + in-modal error (only if pay was clicked)
+        elif modal_still_open and in_modal_error and pay_clicked:
             result["status"] = "failed"
             result["status_text"] = "Payment Declined"
             result["message"] = in_modal_error
@@ -2636,12 +2715,23 @@ async def _parse_payment_result(engine: SiteEngine, captured_events: dict = None
                     break
             logger.info("Payment DECLINED via modal still open + error text")
 
-        # Priority 8: Modal still open (silent failure)
-        elif modal_still_open:
+        # Priority 8: Modal still open (silent failure) — only if pay was clicked
+        elif modal_still_open and pay_clicked:
             result["status"] = "failed"
             result["status_text"] = "Payment Declined"
             result["message"] = "Payment was declined or cancelled. Modal remained open."
             logger.info("Payment DECLINED via modal still open (no error text)")
+
+        # Priority 8b: Modal still open but pay was NEVER clicked — different error
+        elif modal_still_open and not pay_clicked:
+            result["status"] = "error"
+            result["status_text"] = "Pay Button Not Found"
+            result["message"] = (
+                "Could not find or click the Pay/Continue button in RazorPay. "
+                "Payment was never submitted. This is a bot issue, not a card decline. "
+                "Check logs/bot_full.log for the button dump."
+            )
+            logger.error("Pay button was never clicked — payment not submitted")
 
         # Priority 9: Payment ID present (success signal)
         elif result["payment_id"]:
