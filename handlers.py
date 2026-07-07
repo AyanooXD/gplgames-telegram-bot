@@ -36,6 +36,89 @@ class BotStates(StatesGroup):
     WAITING_CC_NUMBER = State()
     WAITING_CC_EXPIRY = State()
     WAITING_CVV = State()
+    # /gpmass states
+    WAITING_GPMASS_URL = State()
+    WAITING_GPMASS_QUANTITY = State()
+    WAITING_GPMASS_CCS = State()
+
+
+def parse_cc_line(line: str) -> dict | None:
+    """
+    Parse a single CC line in format: number|MM|YY|CVV
+    Also accepts: number:MM:YY:CVV, number,MM,YY,CVV, number MM YY CVV
+    Also handles 2-digit year (MM/YY) or 4-digit year (MM/YYYY).
+
+    Returns dict with keys: number, expiry (MM/YY), cvv — or None if invalid.
+    """
+    line = line.strip()
+    if not line:
+        return None
+
+    # Split on | : , space (any separator)
+    parts = re.split(r'[|:,;\s]+', line)
+    parts = [p.strip() for p in parts if p.strip()]
+
+    if len(parts) < 4:
+        return None
+
+    number, month, year, cvv = parts[0], parts[1], parts[2], parts[3]
+
+    # Clean number
+    number = re.sub(r'\D', '', number)
+    if not number.isdigit() or len(number) < 13 or len(number) > 19:
+        return None
+
+    # Clean month
+    month = re.sub(r'\D', '', month)
+    if not month.isdigit() or len(month) > 2:
+        return None
+    month_int = int(month)
+    if month_int < 1 or month_int > 12:
+        return None
+    month = f"{month_int:02d}"
+
+    # Clean year — accept 2 or 4 digits, always output 2 digits
+    year = re.sub(r'\D', '', year)
+    if not year.isdigit():
+        return None
+    if len(year) == 4:
+        year = year[-2:]  # Take last 2 digits
+    elif len(year) != 2:
+        return None
+
+    # Clean CVV
+    cvv = re.sub(r'\D', '', cvv)
+    if not cvv.isdigit() or len(cvv) < 3 or len(cvv) > 4:
+        return None
+
+    return {
+        "number": number,
+        "expiry": f"{month}/{year}",
+        "cvv": cvv,
+        # Masked display version
+        "masked": f"{number[:6]}xxxx{number[-4:]}|{month}|{year}|{cvv}",
+    }
+
+
+def parse_cc_bulk(text: str) -> list[dict]:
+    """
+    Parse multiple CC lines from a single message.
+    Each line should be in format: number|MM|YY|CVV
+    Skips invalid lines and returns list of valid parsed CCs.
+    """
+    ccs = []
+    for line in text.strip().split('\n'):
+        cc = parse_cc_line(line)
+        if cc:
+            ccs.append(cc)
+    return ccs
+
+
+def mask_cc(number: str) -> str:
+    """Mask a card number for display: 461994xxxx7738"""
+    if len(number) < 10:
+        return number
+    return f"{number[:6]}xxxx{number[-4:]}"
 
 
 _active_engines: dict[int, SiteEngine] = {}
@@ -107,7 +190,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "📋 <b>Commands</b>\n"
         "🔑 <code>/login</code> — Sign in (captcha auto-solved)\n"
         "🍪 <code>/cookies</code> — Free login via browser cookies\n"
-        "🔗 <code>/seturl</code> — Set product URL\n"
+        "🔗 <code>/seturl</code> — Single card payment\n"
+        "🚀 <code>/gpmass</code> — Multi-card mass payment\n"
         "📊 <code>/status</code> — Check login status\n"
         "🚪 <code>/logout</code> — Sign out\n"
         "❌ <code>/cancel</code> — Cancel current action\n\n"
@@ -116,6 +200,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "• Card details: never saved, auto-deleted from chat\n"
         "• Wiped from memory after payment\n"
         "• Billing: auto-generated (non-India)\n\n"
+
+        "💳 <b>CC Format</b> (for both <code>/seturl</code> and <code>/gpmass</code>):\n"
+        "<code>number|MM|YY|CVV</code>\n"
+        "<i>Example: <code>4242424242424242|12|28|123</code></i>\n\n"
 
         "<i>Send any command to begin.</i>",
         parse_mode="HTML"
@@ -529,7 +617,54 @@ async def process_cc_number(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
 
-    cc_number = (message.text or "").replace(" ", "").replace("-", "")
+    raw_text = (message.text or "").strip()
+
+    # NEW: Check if user sent full CC in format: number|MM|YY|CVV
+    # If so, parse all fields at once and skip the multi-step prompts
+    if '|' in raw_text or ':' in raw_text:
+        cc_data = parse_cc_line(raw_text)
+        if cc_data:
+            # Delete the user's message for privacy
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            data = await state.get_data()
+            checkout_result = data.get("checkout_result", {})
+            await state.clear()
+
+            engine = _get_engine(message.from_user.id)
+            if not engine:
+                await message.answer("❌ <b>Session lost.</b> Use <code>/login</code> or <code>/cookies</code> again.", parse_mode="HTML")
+                return
+
+            processing = await message.answer(
+                "🔒 <b>Processing Payment</b>\n\n"
+                f"💳 <b>Card:</b> <code>{mask_cc(cc_data['number'])}</code>\n"
+                "⏳ <i>Please wait — do not send any messages</i>",
+                parse_mode="HTML"
+            )
+            _clear_status_tracking(processing)
+            engine.on_status = lambda text: _send_status(processing, text)
+
+            result = await engine.process_razorpay_payment(
+                cc_data["number"], cc_data["expiry"], cc_data["cvv"], checkout_result
+            )
+
+            await _display_payment_result(message, processing, result)
+            return
+        else:
+            await message.answer(
+                "⚠️ <b>Invalid CC format</b>\n\n"
+                "Use: <code>number|MM|YY|CVV</code>\n"
+                "Example: <code>4242424242424242|12|28|123</code>",
+                parse_mode="HTML"
+            )
+            return
+
+    # Original flow: just card number, then ask for expiry and CVV separately
+    cc_number = raw_text.replace(" ", "").replace("-", "")
     if not cc_number.isdigit() or len(cc_number) < 13 or len(cc_number) > 19:
         await message.answer("⚠️ Invalid card number. Send <b>13-19 digits</b>:", parse_mode="HTML")
         return
@@ -633,6 +768,14 @@ async def process_cvv(message: Message, state: FSMContext) -> None:
         cc_number, cc_expiry, cvv, checkout_result
     )
 
+    await _display_payment_result(message, processing, result)
+
+
+async def _display_payment_result(message: Message, processing: Message, result: dict) -> None:
+    """
+    Display payment result with full details.
+    Shared between /seturl single-CC flow and /gpmass multi-CC flow.
+    """
     status = result.get("status", "error")
     msg = result.get("message", "Unknown result")
     order_id = result.get("order_id", "")
@@ -830,13 +973,23 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "📖 <b>Help & Quick Start</b>\n\n"
 
-        "🚀 <b>Quick Flow:</b>\n"
+        "🚀 <b>Single Card Flow (/seturl):</b>\n"
         "1️⃣ <code>/login</code> or <code>/cookies</code> — sign in\n"
         "2️⃣ <code>/seturl</code> — paste product link\n"
         "3️⃣ Send quantity (e.g., <code>1</code>)\n"
         "4️⃣ Billing auto-fills (international)\n"
-        "5️⃣ Send card → expiry → CVV\n"
+        "5️⃣ Send card → expiry → CVV (or all at once: <code>num|MM|YY|CVV</code>)\n"
         "6️⃣ Payment completes automatically\n\n"
+
+        "⚡ <b>Mass Card Flow (/gpmass):</b>\n"
+        "1️⃣ <code>/gpmass</code> — paste product link\n"
+        "2️⃣ Send quantity\n"
+        "3️⃣ Paste MULTIPLE cards (one per line):\n"
+        "<code>4242...|12|28|123</code>\n"
+        "<code>5555...|06|27|456</code>\n"
+        "4️⃣ Bot processes each card one by one\n"
+        "5️⃣ Live progress shows: Charged / Dead / Total\n"
+        "6️⃣ Final summary with categorized results\n\n"
 
         "🔒 <b>Security:</b>\n"
         "• Card data: in-memory only, wiped after use\n"
@@ -854,6 +1007,301 @@ async def cmd_help(message: Message) -> None:
 
 
 # ============================================================
+# /gpmass — Multi-card mass payment
+# ============================================================
+@router.message(F.text.startswith("/gpmass"))
+async def cmd_gpmass(message: Message, state: FSMContext) -> None:
+    if message.edit_date is not None:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    url = parts[1].strip() if len(parts) > 1 else ""
+
+    if not url:
+        await state.set_state(BotStates.WAITING_GPMASS_URL)
+        await message.answer(
+            "🚀 <b>GPL Mass Payment</b>\n\n"
+            "Process multiple cards automatically — one by one.\n"
+            "Get categorized results: <b>Charged</b> vs <b>Dead</b>.\n\n"
+
+            "🔗 <b>Step 1 of 3:</b> Send the <b>product URL</b> from gplgames.net\n"
+            "<i>Example: <code>https://gplgames.net/?p=12345</code></i>",
+            parse_mode="HTML"
+        )
+        return
+
+    await _gpmass_process_url(message, state, url)
+
+
+@router.message(BotStates.WAITING_GPMASS_URL)
+async def gpmass_process_url(message: Message, state: FSMContext) -> None:
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        return
+    if message.edit_date is not None:
+        return
+    await _gpmass_process_url(message, state, message.text or "")
+
+
+async def _gpmass_process_url(message: Message, state: FSMContext, url: str) -> None:
+    await state.clear()
+    engine = _get_engine(message.from_user.id)
+    if not engine:
+        await message.answer(
+            "❌ <b>Not logged in!</b>\n\n"
+            "Use <code>/login</code> or <code>/cookies</code> first.",
+            parse_mode="HTML"
+        )
+        return
+
+    processing = await message.answer("🔍 <b>Verifying product URL...</b>", parse_mode="HTML")
+    _clear_status_tracking(processing)
+    engine.on_status = lambda text: _send_status(processing, text)
+
+    valid = await engine.verify_url(url)
+    if valid:
+        await state.set_state(BotStates.WAITING_GPMASS_QUANTITY)
+        await processing.edit_text(
+            "✅ <b>Product Verified</b>\n\n"
+            f"🆔 <b>Product ID:</b> <code>{engine.product_id}</code>\n\n"
+            "📦 <b>Step 2 of 3:</b> Send the <b>quantity</b> per order (e.g., <code>1</code>)",
+            parse_mode="HTML"
+        )
+    else:
+        await processing.edit_text(
+            "❌ <b>Invalid URL</b>\n\n"
+            "Make sure it's a valid gplgames.net product page.\n"
+            "Type <code>/gpmass</code> to try again.",
+            parse_mode="HTML"
+        )
+
+
+@router.message(BotStates.WAITING_GPMASS_QUANTITY)
+async def gpmass_process_quantity(message: Message, state: FSMContext) -> None:
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        return
+    if message.edit_date is not None:
+        return
+
+    text = (message.text or "").strip()
+    if not text.isdigit() or int(text) < 1 or int(text) > 999:
+        await message.answer("⚠️ Send a valid number between <b>1</b> and <b>999</b>:", parse_mode="HTML")
+        return
+
+    quantity = int(text)
+    await state.update_data(gpmass_quantity=quantity)
+    await state.set_state(BotStates.WAITING_GPMASS_CCS)
+    await message.answer(
+        "✅ <b>Quantity set</b>\n\n"
+        "💳 <b>Step 3 of 3:</b> Send your <b>cards</b> — one per line\n\n"
+        "📋 <b>Format:</b> <code>number|MM|YY|CVV</code>\n"
+        "<i>Example:</i>\n"
+        "<code>4242424242424242|12|28|123</code>\n"
+        "<code>5555555555554444|06|27|456</code>\n\n"
+        "🔒 <i>All card messages will be auto-deleted for privacy</i>",
+        parse_mode="HTML"
+    )
+
+
+@router.message(BotStates.WAITING_GPMASS_CCS)
+async def gpmass_process_ccs(message: Message, state: FSMContext) -> None:
+    if message.text and message.text.startswith("/"):
+        await state.clear()
+        return
+    if message.edit_date is not None:
+        return
+
+    raw_text = message.text or ""
+
+    # Delete the user's message immediately for privacy
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Parse all CC lines
+    ccs = parse_cc_bulk(raw_text)
+    if not ccs:
+        await message.answer(
+            "⚠️ <b>No valid cards found</b>\n\n"
+            "Make sure each line is in format: <code>number|MM|YY|CVV</code>\n"
+            "Try again or send <code>/cancel</code> to abort.",
+            parse_mode="HTML"
+        )
+        return
+
+    data = await state.get_data()
+    quantity = data.get("gpmass_quantity", 1)
+    await state.clear()
+
+    engine = _get_engine(message.from_user.id)
+    if not engine:
+        await message.answer("❌ <b>Session lost.</b> Use <code>/login</code> or <code>/cookies</code> again.", parse_mode="HTML")
+        return
+
+    total = len(ccs)
+    charged = []   # Successful payments
+    dead = []      # Declined cards
+    errors = []    # Bot errors (not card declines)
+    pending = []   # Pending review
+
+    # Create the live progress message
+    progress_msg = await message.answer(
+        f"🚀 <b>GPL Mass Payment Started</b>\n\n"
+        f"📊 <b>Total Cards:</b> <code>{total}</code>\n"
+        f"📦 <b>Quantity:</b> <code>{quantity}</code>\n\n"
+        f"⏳ <b>Processing card 1 of {total}...</b>\n\n"
+        f"<i>This will take a while — do not send any messages</i>",
+        parse_mode="HTML"
+    )
+    _clear_status_tracking(progress_msg)
+
+    import asyncio as _asyncio
+
+    for i, cc in enumerate(ccs):
+        masked = mask_cc(cc["number"])
+
+        # Update progress
+        try:
+            await progress_msg.edit_text(
+                f"🚀 <b>GPL Mass Payment</b>\n\n"
+                f"📊 <b>Progress:</b> <code>{i}/{total}</code>\n"
+                f"✅ <b>Charged:</b> <code>{len(charged)}</code>\n"
+                f"❌ <b>Dead:</b> <code>{len(dead)}</code>\n"
+                f"⚠️ <b>Errors:</b> <code>{len(errors)}</code>\n\n"
+                f"⏳ <b>Now processing:</b> <code>{masked}</code>\n"
+                f"<i>Card {i+1} of {total}</i>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+        # Step 1: Add to cart
+        engine.on_status = lambda text, m=progress_msg, idx=i, msk=masked, tot=total: _send_status(m, text)
+
+        added = await engine.add_to_cart(quantity)
+        if not added:
+            errors.append({
+                "cc": masked,
+                "reason": "Failed to add to cart",
+                "result": {"status": "error", "message": "Add to cart failed"},
+            })
+            continue
+
+        # Step 2: Get checkout page + auto-fill billing + submit checkout
+        checkout_data = await engine.get_checkout_page()
+        if checkout_data.get("error") or not checkout_data.get("nonce"):
+            errors.append({
+                "cc": masked,
+                "reason": "Checkout page error",
+                "result": {"status": "error", "message": checkout_data.get("error", "No nonce")},
+            })
+            continue
+
+        checkout_result = await engine.fill_and_submit_checkout(billing=None, nonce=checkout_data.get("nonce", ""))
+        if checkout_result.get("result") == "failure":
+            errors.append({
+                "cc": masked,
+                "reason": "Checkout submit failed",
+                "result": {"status": "error", "message": checkout_result.get("messages", "Unknown")},
+            })
+            continue
+
+        # Step 3: Process payment with this CC
+        try:
+            result = await engine.process_razorpay_payment(
+                cc["number"], cc["expiry"], cc["cvv"], checkout_result
+            )
+        except Exception as e:
+            errors.append({
+                "cc": masked,
+                "reason": f"Payment exception: {str(e)[:80]}",
+                "result": {"status": "error", "message": str(e)[:100]},
+            })
+            continue
+
+        # Categorize result
+        status = result.get("status", "error")
+        result["masked_cc"] = masked
+
+        if status == "success":
+            charged.append({"cc": masked, "result": result})
+        elif status == "failed":
+            dead.append({"cc": masked, "result": result})
+        elif status == "pending":
+            pending.append({"cc": masked, "result": result})
+        else:
+            errors.append({"cc": masked, "reason": result.get("message", "Unknown"), "result": result})
+
+        # Small delay between cards to avoid rate limiting
+        await _asyncio.sleep(2)
+
+    # Final summary
+    summary_lines = [
+        f"🏁 <b>Mass Payment Complete</b>\n",
+        f"📊 <b>Summary</b>",
+        f"━━━━━━━━━━━━━━━━━━━",
+        f"📋 <b>Total Cards:</b> <code>{total}</code>",
+        f"✅ <b>Charged:</b> <code>{len(charged)}</code>",
+        f"❌ <b>Dead:</b> <code>{len(dead)}</code>",
+        f"⏳ <b>Pending:</b> <code>{len(pending)}</code>",
+        f"⚠️ <b>Errors:</b> <code>{len(errors)}</code>",
+    ]
+
+    # Charged section
+    if charged:
+        summary_lines.append(f"\n✅ <b>CHARGED ({len(charged)})</b>")
+        summary_lines.append("━━━━━━━━━━━━━━━━━━━")
+        for item in charged:
+            r = item["result"]
+            order_id = r.get("order_id", "")
+            payment_id = r.get("payment_id", "")
+            amount = r.get("amount", "")
+            line = f"💚 <code>{item['cc']}</code>"
+            if order_id:
+                line += f"\n   🆔 <code>{order_id}</code>"
+            if payment_id:
+                line += f"\n   💳 <code>{payment_id}</code>"
+            if amount:
+                line += f"\n   💰 ₹{amount}"
+            summary_lines.append(line)
+
+    # Dead section
+    if dead:
+        summary_lines.append(f"\n❌ <b>DEAD ({len(dead)})</b>")
+        summary_lines.append("━━━━━━━━━━━━━━━━━━━")
+        for item in dead:
+            r = item["result"]
+            reason = r.get("decline_reason") or r.get("message", "Declined")
+            line = f"🔴 <code>{item['cc']}</code>"
+            line += f"\n   💬 {html.escape(str(reason)[:80])}"
+            summary_lines.append(line)
+
+    # Pending section
+    if pending:
+        summary_lines.append(f"\n⏳ <b>PENDING ({len(pending)})</b>")
+        summary_lines.append("━━━━━━━━━━━━━━━━━━━")
+        for item in pending:
+            summary_lines.append(f"🟡 <code>{item['cc']}</code>")
+
+    # Errors section
+    if errors:
+        summary_lines.append(f"\n⚠️ <b>BOT ERRORS ({len(errors)})</b>")
+        summary_lines.append("━━━━━━━━━━━━━━━━━━━")
+        for item in errors:
+            summary_lines.append(f"⚠️ <code>{item['cc']}</code>")
+            summary_lines.append(f"   💬 {html.escape(str(item.get('reason', ''))[:80])}")
+
+    summary_text = "\n".join(summary_lines)
+
+    try:
+        await progress_msg.edit_text(summary_text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        await message.answer(summary_text, parse_mode="HTML", disable_web_page_preview=True)
+
+
+# ============================================================
 # FALLBACK — catch non-text / unrecognized messages
 # ============================================================
 @router.message()
@@ -868,9 +1316,12 @@ async def fallback(message: Message, state: FSMContext) -> None:
             BotStates.WAITING_URL:          "the <b>product URL</b> from gplgames.net",
             BotStates.WAITING_QUANTITY:     "a <b>quantity</b> (e.g., <code>1</code>)",
             BotStates.WAITING_BILLING:      "<b>billing details</b> (comma-separated, 8 fields)",
-            BotStates.WAITING_CC_NUMBER:    "your <b>card number</b> (13-19 digits)",
+            BotStates.WAITING_CC_NUMBER:    "your <b>card number</b> or <code>number|MM|YY|CVV</code>",
             BotStates.WAITING_CC_EXPIRY:    "your <b>card expiry</b> as <code>MM/YY</code>",
             BotStates.WAITING_CVV:          "your <b>CVV</b> (3-4 digits)",
+            BotStates.WAITING_GPMASS_URL:       "the <b>product URL</b> from gplgames.net",
+            BotStates.WAITING_GPMASS_QUANTITY: "a <b>quantity</b> per order (e.g., <code>1</code>)",
+            BotStates.WAITING_GPMASS_CCS:      "your <b>cards</b> (one per line, format: <code>num|MM|YY|CVV</code>)",
         }
         hint = hints.get(current_state, "the expected input")
         await message.answer(
