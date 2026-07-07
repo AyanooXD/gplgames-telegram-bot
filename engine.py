@@ -2419,11 +2419,17 @@ async def _parse_payment_result(engine: SiteEngine, captured_events: dict = None
         # "Thank you for shopping with us. Your account has been charged and
         #  your transaction is successful. We will be processing your order soon."
         # (Source: DEFAULT_SUCCESS_MESSAGE constant in woo-razorpay.php line 221)
+        #
+        # Additionally, the success page shows "Payment Successful" as a
+        # banner/heading (user-confirmed). Including all known variants.
         razorpay_success_phrases = [
             "your transaction is successful",
             "your account has been charged",
             "we will be processing your order soon",
             "thank you for shopping with us",
+            "payment successful",        # User-confirmed: appears on success page
+            "payment success",
+            "transaction successful",
         ]
         razorpay_success_hits = sum(1 for p in razorpay_success_phrases if p in text_lower)
 
